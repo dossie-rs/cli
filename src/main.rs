@@ -28,26 +28,17 @@ use thiserror::Error;
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
-const EMBEDDED_CSS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/global.css"
-));
-const EMBEDDED_FAVICON: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/favicon.svg"
-));
-const THEME_INIT_SCRIPT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/theme-init.js"
-));
+const EMBEDDED_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/global.css"));
+const EMBEDDED_FAVICON: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/favicon.svg"));
+const THEME_INIT_SCRIPT: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/theme-init.js"));
 const THEME_TOGGLE_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/theme-toggle.js"
 ));
-const MINI_TOC_SCRIPT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/mini-toc.js"
-));
+const MINI_TOC_SCRIPT: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mini-toc.js"));
 const INDEX_SEARCH_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/index-search.js"
@@ -242,7 +233,11 @@ impl Assets {
     }
 
     fn theme_toggle_script(&self) -> String {
-        Self::read_script(&self.theme_toggle_source, THEME_TOGGLE_SCRIPT, "theme toggle")
+        Self::read_script(
+            &self.theme_toggle_source,
+            THEME_TOGGLE_SCRIPT,
+            "theme toggle",
+        )
     }
 
     fn mini_toc_script(&self) -> String {
@@ -250,7 +245,11 @@ impl Assets {
     }
 
     fn index_search_script(&self) -> String {
-        Self::read_script(&self.index_search_source, INDEX_SEARCH_SCRIPT, "index search")
+        Self::read_script(
+            &self.index_search_source,
+            INDEX_SEARCH_SCRIPT,
+            "index search",
+        )
     }
 }
 
@@ -774,12 +773,10 @@ fn supports_color() -> bool {
 
 fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
     let mut args = args.iter();
-    let Some(command) = args.next() else {
-        return None;
-    };
+    let command = args.next()?;
 
     match command.as_str() {
-        "serve" | "prepare" => args.next().map(|path| PathBuf::from(path)),
+        "serve" | "prepare" => args.next().map(PathBuf::from),
         "build" => {
             let mut input_path = None;
 

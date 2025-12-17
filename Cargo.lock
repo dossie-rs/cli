@@ -2032,8 +2032,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "indexmap-allocator-api"
-version = "2.7.1"
-source = "git+https://github.com/Hans-Halverson/indexmap-allocator-api.git#36852f985c01fb9f58f2d9e510655ca1dbb1f4d0"
