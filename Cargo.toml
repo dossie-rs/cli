@@ -1,8 +1,12 @@
 [package]
 name = "dossiers"
+description = "Dossiers: A home for your specs, policies, and process docs"
 version = "0.1.0"
 edition = "2021"
 autobins = false
+homepage = "https://dossie.rs"
+repository = "https://github.com/dossie-rs/cli"
+license = "MIT"
 
 [[bin]]
 name = "dossiers"
