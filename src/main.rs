@@ -529,36 +529,91 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
         bail!("Provided path is not a directory: {}", dir.display());
     }
 
-    let mut spec_dirs = Vec::new();
+    #[derive(Debug)]
+    enum SpecLocation {
+        Directory(PathBuf),
+        File { path: PathBuf, format: DocFormat },
+    }
+
+    let mut spec_locations: Vec<(String, String, SpecLocation)> = Vec::new();
+    let mut file_spec_ids: HashSet<String> = HashSet::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let dir_name = entry
+        let name = entry
             .file_name()
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid directory name under {}", dir.display()))?
+            .ok_or_else(|| anyhow::anyhow!("Invalid entry name under {}", dir.display()))?
             .to_string();
-        let Some(id) = extract_spec_id(&dir_name) else {
+        let Some(id) = extract_spec_id(&name) else {
             continue;
         };
-        spec_dirs.push((id, dir_name, path));
+
+        if path.is_dir() {
+            spec_locations.push((id, name, SpecLocation::Directory(path)));
+            continue;
+        }
+
+        if path.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+
+            let format = match ext.as_str() {
+                "md" | "markdown" => Some(DocFormat::Markdown),
+                "adoc" | "asciidoc" => Some(DocFormat::Asciidoc),
+                _ => None,
+            };
+
+            if let Some(format) = format {
+                file_spec_ids.insert(id.clone());
+                let dir_name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                spec_locations.push((id, dir_name, SpecLocation::File { path, format }));
+            }
+        }
     }
 
-    if spec_dirs.is_empty() {
+    if spec_locations.is_empty() {
         bail!(
-            "No spec directories found in {} (expected subdirectories like 0001-*)",
+            "No spec documents found in {} (expected subdirectories like 0001-* or files like 0001-*.md)",
             dir.display()
         );
     }
 
     let mut specs = Vec::new();
     let mut static_mounts = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
-    for (spec_id, dir_name, path) in spec_dirs {
-        let (doc_path, format) = find_doc_file(&path)?;
+    for (spec_id, dir_name, location) in spec_locations {
+        if seen_ids.contains(&spec_id) {
+            continue;
+        }
+        let (doc_path, format, static_root) = match location {
+            SpecLocation::Directory(path) => match find_doc_file(&path) {
+                Ok((doc_path, format)) => (doc_path, format, path),
+                Err(err) => {
+                    // If there's a file-based spec with the same ID, this directory is likely assets-only.
+                    if file_spec_ids.contains(&spec_id) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            },
+            SpecLocation::File { path, format } => {
+                let static_root = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| dir.to_path_buf());
+                (path, format, static_root)
+            }
+        };
+        seen_ids.insert(spec_id.clone());
         let source = fs::read_to_string(&doc_path)
             .with_context(|| format!("Reading spec document at {}", doc_path.display()))?;
 
@@ -589,7 +644,7 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
             format,
         });
 
-        static_mounts.push((format!("/{}", spec_id), path));
+        static_mounts.push((format!("/{}", spec_id), static_root));
     }
 
     Ok(LoadResult {
