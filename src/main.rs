@@ -319,7 +319,7 @@ impl FrontmatterAuthors {
     }
 }
 
-fn parse_doc_metadata(source: &str, format: &DocFormat) -> ParsedMetadata {
+fn parse_doc_metadata(source: &str, format: &DocFormat, fallback_title: &str) -> ParsedMetadata {
     let mut status = "DRAFT".to_string();
     let mut created = None;
     let mut updated = None;
@@ -361,7 +361,7 @@ fn parse_doc_metadata(source: &str, format: &DocFormat) -> ParsedMetadata {
         }
     }
 
-    let title = extract_title(source, format);
+    let title = extract_leading_title(source, format).unwrap_or_else(|| fallback_title.to_string());
 
     ParsedMetadata {
         title,
@@ -433,7 +433,7 @@ fn strip_frontmatter(source: &str, format: &DocFormat) -> String {
     }
 }
 
-fn parse_doc(source: &str, format: &DocFormat) -> ParsedDoc {
+fn parse_doc(source: &str, format: &DocFormat, fallback_title: &str) -> ParsedDoc {
     if let DocFormat::Markdown = format {
         if let Some((frontmatter, body)) = parse_markdown_frontmatter(source) {
             let links = frontmatter
@@ -454,8 +454,16 @@ fn parse_doc(source: &str, format: &DocFormat) -> ParsedDoc {
                 })
                 .collect::<Vec<_>>();
 
-            let mut metadata = ParsedMetadata {
-                title: frontmatter.title.unwrap_or_default(),
+            let leading_title = extract_leading_title(&body, format);
+            let frontmatter_title = frontmatter
+                .title
+                .map(|title| title.trim().to_string())
+                .filter(|title| !title.is_empty());
+
+            let metadata = ParsedMetadata {
+                title: leading_title
+                    .or(frontmatter_title)
+                    .unwrap_or_else(|| fallback_title.to_string()),
                 status: frontmatter.status.unwrap_or_else(|| "DRAFT".to_string()),
                 created: frontmatter.created.as_deref().and_then(parse_date),
                 updated: frontmatter.updated.as_deref().and_then(parse_date),
@@ -467,16 +475,11 @@ fn parse_doc(source: &str, format: &DocFormat) -> ParsedDoc {
                 ),
                 links,
             };
-
-            if metadata.title.is_empty() {
-                metadata.title = extract_title(&body, format);
-            }
-
             return ParsedDoc { metadata, body };
         }
     }
 
-    let metadata = parse_doc_metadata(source, format);
+    let metadata = parse_doc_metadata(source, format, fallback_title);
     ParsedDoc {
         metadata,
         body: source.to_string(),
@@ -617,10 +620,11 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
         let source = fs::read_to_string(&doc_path)
             .with_context(|| format!("Reading spec document at {}", doc_path.display()))?;
 
-        let parsed_doc = parse_doc(&source, &format);
+        let display_name = display_name_from_dir(&dir_name);
+        let parsed_doc = parse_doc(&source, &format, &display_name);
         let meta = parsed_doc.metadata;
         let title = if meta.title.is_empty() {
-            dir_name.clone()
+            display_name.clone()
         } else {
             meta.title.clone()
         };
@@ -2066,19 +2070,67 @@ fn parse_date(value: &str) -> Option<i64> {
         })
 }
 
-fn extract_title(source: &str, format: &DocFormat) -> String {
+fn extract_leading_title(source: &str, format: &DocFormat) -> Option<String> {
     match format {
-        DocFormat::Asciidoc => source
-            .lines()
-            .find(|line| line.trim_start().starts_with('='))
-            .map(|line| line.trim_start_matches('=').trim().to_string()),
-        DocFormat::Markdown => source
-            .lines()
-            .find(|line| line.trim_start().starts_with('#'))
-            .map(|line| line.trim_start_matches('#').trim().to_string()),
+        DocFormat::Asciidoc => extract_asciidoc_leading_title(source),
+        DocFormat::Markdown => extract_markdown_leading_h1(source),
     }
-    .filter(|s| !s.is_empty())
-    .unwrap_or_else(|| "Untitled specification".to_string())
+}
+
+fn extract_markdown_leading_h1(source: &str) -> Option<String> {
+    let mut lines = source.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with('#') {
+            let hashes = trimmed_start.chars().take_while(|c| *c == '#').count();
+            if hashes == 1 {
+                let title = trimmed_start.trim_start_matches('#').trim();
+                if !title.is_empty() {
+                    return Some(title.to_string());
+                }
+            }
+            return None;
+        }
+
+        if let Some(underline) = lines.peek() {
+            let underline_trimmed = underline.trim();
+            if !underline_trimmed.is_empty() && underline_trimmed.chars().all(|c| c == '=') {
+                lines.next();
+                return Some(trimmed.to_string()).filter(|title| !title.is_empty());
+            }
+        }
+
+        return None;
+    }
+
+    None
+}
+
+fn extract_asciidoc_leading_title(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let leading_equals = trimmed.chars().take_while(|c| *c == '=').count();
+        if leading_equals == 1 {
+            let title = trimmed.trim_start_matches('=').trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+
+        return None;
+    }
+
+    None
 }
 
 fn extract_spec_id(name: &str) -> Option<String> {
@@ -2088,6 +2140,19 @@ fn extract_spec_id(name: &str) -> Option<String> {
     ID_RE
         .captures(name)
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+}
+
+fn display_name_from_dir(dir_name: &str) -> String {
+    lazy_static! {
+        static ref NAME_PREFIX_RE: Regex = Regex::new(r"^\d{4,}-").unwrap();
+    }
+
+    let cleaned = NAME_PREFIX_RE.replace(dir_name, "").to_string();
+    if cleaned.is_empty() {
+        dir_name.to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn find_doc_file(dir: &Path) -> Result<(PathBuf, DocFormat)> {
