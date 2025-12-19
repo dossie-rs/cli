@@ -261,7 +261,9 @@ struct AppState {
     specs: Vec<SpecDocument>,
     specs_by_id: HashMap<String, SpecDocument>,
     spec_ids: HashSet<String>,
+    display_prefix: String,
     site_name: String,
+    site_description: String,
     assets: Assets,
     renderer: DocRenderer,
 }
@@ -536,7 +538,10 @@ fn load_specs_from_json(path: &Path, _config: &ProjectConfiguration) -> Result<L
     })
 }
 
-fn load_specs_from_directory(dir: &Path, project_config: &ProjectConfiguration) -> Result<LoadResult> {
+fn load_specs_from_directory(
+    dir: &Path,
+    project_config: &ProjectConfiguration,
+) -> Result<LoadResult> {
     if !dir.is_dir() {
         bail!("Provided path is not a directory: {}", dir.display());
     }
@@ -968,8 +973,12 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  dossiers [-c <config-file>] serve <path-to-spec-data.json|path-to-spec-directory>");
-    eprintln!("  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>");
+    eprintln!(
+        "  dossiers [-c <config-file>] serve <path-to-spec-data.json|path-to-spec-directory>"
+    );
+    eprintln!(
+        "  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>"
+    );
     eprintln!("  dossiers [-c <config-file>] build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
 }
 
@@ -981,15 +990,27 @@ fn validate_path(path: String) -> Result<PathBuf> {
     Ok(input_path)
 }
 
+fn project_root_from(config_path: Option<&Path>, input_path: &Path) -> PathBuf {
+    if let Some(path) = config_path {
+        if let Some(parent) = path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+
+    input_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
 async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
-    let project_root = project_root();
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
 
     let assets = Assets::from_assets_dir(project_root.join("assets"));
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state, static_mounts) =
-        build_app_state(&input_path, site_name, assets, project_config)?;
+    let (state, static_mounts) = build_app_state(&input_path, site_name, assets, project_config)?;
 
     println!("Serving specs on http://localhost:8080");
     HttpServer::new(move || {
@@ -1016,7 +1037,7 @@ async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result
 }
 
 fn run_prepare(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
-    let project_root = project_root();
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
     let (specs, _) = load_and_sort_specs(&input_path, &project_config)?;
 
@@ -1039,7 +1060,7 @@ fn run_prepare(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> 
 }
 
 fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
-    let project_root = project_root();
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
     let assets = Assets::embedded();
     let site_name = resolve_site_name(&project_root, &project_config);
@@ -1120,7 +1141,9 @@ fn build_app_state(
         specs,
         specs_by_id,
         spec_ids,
+        display_prefix: project_config.prefix.clone().unwrap_or_default(),
         site_name,
+        site_description: project_config.description.unwrap_or_default(),
         assets,
         renderer,
     });
@@ -1388,8 +1411,9 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
     let theme_toggle_js = state.assets.theme_toggle_script();
     base_layout(
         site_name,
+        &state.site_description,
         site_name,
-        "Index of local specification documents",
+        &state.site_description,
         LayoutAssets {
             css: &css,
             theme_init_js: &theme_init_js,
@@ -1401,7 +1425,12 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
 }
 
 fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefix: &str) -> Markup {
-    let title = format!("SPEC-{} {} - {}", spec.id, spec.title, state.site_name);
+    let display_id = if state.display_prefix.is_empty() {
+        spec.id.clone()
+    } else {
+        format!("{}{}", state.display_prefix, spec.id)
+    };
+    let title = format!("{display_id} {} - {}", spec.title, state.site_name);
     let description = format!("Rendered specification {}", spec.dir_name);
 
     let links: Vec<(&str, &str)> = spec
@@ -1475,6 +1504,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     let theme_toggle_js = state.assets.theme_toggle_script();
     base_layout(
         &state.site_name,
+        &state.site_description,
         &title,
         &description,
         LayoutAssets {
@@ -1534,6 +1564,7 @@ fn render_author(
     let theme_toggle_js = state.assets.theme_toggle_script();
     base_layout(
         &state.site_name,
+        &state.site_description,
         &title,
         &description,
         LayoutAssets {
@@ -1580,6 +1611,7 @@ struct LayoutAssets<'a> {
 
 fn base_layout(
     site_name: &str,
+    site_description: &str,
     title: &str,
     description: &str,
     assets: LayoutAssets,
@@ -1612,7 +1644,9 @@ fn base_layout(
                             img class="brand-mark" src=(favicon_href) alt="" role="presentation";
                             span class="brand-name" { (site_name) }
                         }
-                        span class="tagline" { "Local index of the specification docs" }
+                        @if !site_description.is_empty() {
+                            span class="tagline" { (site_description) }
+                        }
                         button id="theme-toggle" type="button" class="theme-toggle" aria-label="Toggle light/dark mode" {
                             span class="sr-only" { "Switch color theme" }
                             svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" {
@@ -2471,8 +2505,8 @@ fn resolve_site_name(_project_root: &Path, project_config: &ProjectConfiguration
         }
     }
 
-    if let Some(name) = project_config.name.clone() {
-        let trimmed = name.trim();
+    if let Some(title) = project_config.title.clone() {
+        let trimmed = title.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
@@ -2485,20 +2519,10 @@ fn load_project_configuration(
     project_root: &Path,
     override_path: Option<&Path>,
 ) -> ProjectConfiguration {
-    let config_path = override_path
-        .map(|p| p.to_path_buf())
-        .or_else(|| {
-            let rust_toml = project_root.join("rust.toml");
-            if rust_toml.exists() {
-                return Some(rust_toml);
-            }
-            let default = project_root.join("src/generated/project-config.json");
-            if default.exists() {
-                Some(default)
-            } else {
-                None
-            }
-        });
+    let config_path = override_path.map(|p| p.to_path_buf()).or_else(|| {
+        let default = project_root.join("dossiers.toml");
+        default.exists().then_some(default)
+    });
 
     let Some(path) = config_path else {
         return ProjectConfiguration::default();
@@ -2515,28 +2539,15 @@ fn load_project_configuration(
         }
     };
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase());
-
-    let parsed = match ext.as_deref() {
-        Some("toml") => parse_toml_config(&raw, &path),
-        _ => serde_json::from_str::<Value>(&raw).map_err(|err| err.to_string()),
-    };
-
-    match parsed {
+    match parse_toml_config(&raw, &path) {
         Ok(value) => ProjectConfiguration::from_json_value(&value),
-        Err(_) => match parse_toml_config(&raw, &path) {
-            Ok(value) => ProjectConfiguration::from_json_value(&value),
-            Err(err) => {
-                eprintln!(
-                    "Warning: failed to parse project configuration at {}: {err}",
-                    path.display()
-                );
-                ProjectConfiguration::default()
-            }
-        },
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to parse project configuration at {}: {err}",
+                path.display()
+            );
+            ProjectConfiguration::default()
+        }
     }
 }
 
@@ -2547,12 +2558,6 @@ fn parse_toml_config(raw: &str, path: &Path) -> Result<Value, String> {
         .map_err(|err| format!("failed to parse config {}: {err}", path.display()))
 }
 
-fn project_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf()
-}
 #[cfg(test)]
 mod tests {
     use super::*;

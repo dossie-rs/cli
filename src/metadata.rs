@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use pulldown_cmark::{CowStr, Event, Parser};
+use pulldown_cmark::{Event, Parser};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -32,6 +32,14 @@ pub struct MetadataReadResult {
 #[derive(Debug, Clone, Default)]
 pub struct ProjectConfiguration {
     pub name: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub repository: Option<String>,
+    pub subdirectory: Option<String>,
+    pub prefix: Option<String>,
+    pub public_access: Option<bool>,
+    pub allowed_github_organizations: Vec<String>,
+    pub allowed_google_workspace_domains: Vec<String>,
     pub statuses: Vec<String>,
     pub default_status: Option<String>,
     pub new_status: Option<String>,
@@ -56,18 +64,15 @@ pub struct ExtraMetadataField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MetadataValueType {
+    #[default]
     String,
     Number,
     Boolean,
     Date,
 }
 
-impl Default for MetadataValueType {
-    fn default() -> Self {
-        Self::String
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -155,11 +160,10 @@ impl MetadataReader {
             }
         }
 
-        if metadata.title.is_none() && parsed_list {
-            if !fallback_title.is_empty() {
+        if metadata.title.is_none() && parsed_list
+            && !fallback_title.is_empty() {
                 metadata.title = Some(fallback_title.to_string());
             }
-        }
 
         if metadata.title.is_none() {
             metadata.title = extract_leading_title(&body, &format)
@@ -553,6 +557,67 @@ impl ProjectConfiguration {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let title = value
+            .get("title")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let description = value
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let repository = value
+            .get("repository")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let subdirectory = value
+            .get("subdirectory")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let prefix = value
+            .get("prefix")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let public_access = value
+            .get("public_access")
+            .or_else(|| value.get("publicAccess"))
+            .and_then(JsonValue::as_bool);
+
+        let allowed_github_organizations = value
+            .get("allowed_github_organizations")
+            .or_else(|| value.get("allowedGithubOrganizations"))
+            .and_then(JsonValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let allowed_google_workspace_domains = value
+            .get("allowed_google_workspace_domains")
+            .or_else(|| value.get("allowedGoogleWorkspaceDomains"))
+            .and_then(JsonValue::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let statuses = value
             .get("statuses")
             .or_else(|| value.get("statusList"))
@@ -621,6 +686,14 @@ impl ProjectConfiguration {
 
         Self {
             name,
+            title,
+            description,
+            repository,
+            subdirectory,
+            prefix,
+            public_access,
+            allowed_github_organizations,
+            allowed_google_workspace_domains,
             statuses,
             default_status,
             new_status,
