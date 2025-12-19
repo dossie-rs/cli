@@ -5,6 +5,8 @@ use std::fmt::Write;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
+mod metadata;
+
 use actix_files::Files;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{bail, Context, Result};
@@ -20,6 +22,7 @@ use asciidoc_parser::{
 use chrono::{Local, NaiveDate, TimeZone};
 use lazy_static::lazy_static;
 use maud::{html, Markup, PreEscaped};
+use metadata::{MetadataReader, ProjectConfiguration};
 use pulldown_cmark::{html as md_html, Options as MdOptions, Parser};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -270,6 +273,7 @@ struct LoadResult {
     static_mounts: Vec<StaticMount>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ParsedMetadata {
     title: String,
@@ -280,6 +284,7 @@ struct ParsedMetadata {
     links: Vec<Link>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ParsedDoc {
     metadata: ParsedMetadata,
@@ -292,6 +297,7 @@ struct Link {
     href: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum FrontmatterAuthors {
@@ -311,6 +317,7 @@ struct Frontmatter {
 }
 
 impl FrontmatterAuthors {
+    #[allow(dead_code)]
     fn into_vec(self) -> Vec<String> {
         match self {
             FrontmatterAuthors::Single(value) => vec![value],
@@ -319,6 +326,7 @@ impl FrontmatterAuthors {
     }
 }
 
+#[allow(dead_code)]
 fn parse_doc_metadata(source: &str, format: &DocFormat, fallback_title: &str) -> ParsedMetadata {
     let mut status = "DRAFT".to_string();
     let mut created = None;
@@ -433,6 +441,7 @@ fn strip_frontmatter(source: &str, format: &DocFormat) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn parse_doc(source: &str, format: &DocFormat, fallback_title: &str) -> ParsedDoc {
     if let DocFormat::Markdown = format {
         if let Some((frontmatter, body)) = parse_markdown_frontmatter(source) {
@@ -507,7 +516,7 @@ where
         .collect()
 }
 
-fn load_specs_from_json(path: &Path) -> Result<LoadResult> {
+fn load_specs_from_json(path: &Path, _config: &ProjectConfiguration) -> Result<LoadResult> {
     let raw_specs: Vec<GeneratedSpec> = serde_json::from_reader(
         File::open(path).with_context(|| format!("Opening {}", path.display()))?,
     )
@@ -527,7 +536,7 @@ fn load_specs_from_json(path: &Path) -> Result<LoadResult> {
     })
 }
 
-fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
+fn load_specs_from_directory(dir: &Path, project_config: &ProjectConfiguration) -> Result<LoadResult> {
     if !dir.is_dir() {
         bail!("Provided path is not a directory: {}", dir.display());
     }
@@ -592,6 +601,7 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
     let mut specs = Vec::new();
     let mut static_mounts = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
+    let metadata_reader = MetadataReader::new(project_config.clone());
 
     for (spec_id, dir_name, location) in spec_locations {
         if seen_ids.contains(&spec_id) {
@@ -621,26 +631,30 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
             .with_context(|| format!("Reading spec document at {}", doc_path.display()))?;
 
         let display_name = display_name_from_dir(&dir_name);
-        let parsed_doc = parse_doc(&source, &format, &display_name);
+        let parsed_doc = metadata_reader.read(&source, format, &display_name);
         let meta = parsed_doc.metadata;
-        let title = if meta.title.is_empty() {
-            display_name.clone()
-        } else {
-            meta.title.clone()
-        };
+        let title = meta
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| display_name.clone());
 
-        let updated_sort = meta
-            .updated
-            .or(meta.created)
+        let created = meta.created.as_deref().and_then(parse_date);
+        let updated = meta.updated.as_deref().and_then(parse_date).or(created);
+
+        let updated_sort = updated
+            .or(created)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         specs.push(SpecDocument {
             id: spec_id.clone(),
             dir_name,
             title,
-            status: meta.status,
-            created: meta.created,
-            updated: meta.updated.or(meta.created),
+            status: meta
+                .status
+                .unwrap_or_else(|| metadata_reader.default_status()),
+            created,
+            updated,
             authors: meta.authors,
             links: meta.links,
             updated_sort,
@@ -657,16 +671,19 @@ fn load_specs_from_directory(dir: &Path) -> Result<LoadResult> {
     })
 }
 
-fn load_specs(input_path: &Path) -> Result<LoadResult> {
+fn load_specs(input_path: &Path, project_config: &ProjectConfiguration) -> Result<LoadResult> {
     if input_path.is_dir() {
-        load_specs_from_directory(input_path)
+        load_specs_from_directory(input_path, project_config)
     } else {
-        load_specs_from_json(input_path)
+        load_specs_from_json(input_path, project_config)
     }
 }
 
-fn load_and_sort_specs(input_path: &Path) -> Result<(Vec<SpecDocument>, Vec<StaticMount>)> {
-    let mut load_result = load_specs(input_path)?;
+fn load_and_sort_specs(
+    input_path: &Path,
+    project_config: &ProjectConfiguration,
+) -> Result<(Vec<SpecDocument>, Vec<StaticMount>)> {
+    let mut load_result = load_specs(input_path, project_config)?;
     load_result.specs.sort_by(|a, b| {
         b.updated_sort
             .cmp(&a.updated_sort)
@@ -722,8 +739,8 @@ async fn main() -> Result<()> {
     let project_dir = project_dir_from_args(&raw_args);
     print_banner(project_dir.as_deref());
 
-    let command = match parse_args(&raw_args) {
-        Ok(cmd) => cmd,
+    let (config_path, command) = match parse_args(&raw_args) {
+        Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("{err}");
             print_usage();
@@ -731,7 +748,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Err(err) = run_command(command).await {
+    if let Err(err) = run_command(command, config_path).await {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -739,18 +756,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_command(command: CliCommand) -> Result<()> {
+async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Result<()> {
     match command {
-        CliCommand::Serve(input_path) => run_server(input_path).await,
+        CliCommand::Serve(input_path) => run_server(input_path, config_path).await,
         CliCommand::Prepare(input_path) => {
-            run_prepare(input_path)?;
+            run_prepare(input_path, config_path)?;
             Ok(())
         }
         CliCommand::Build {
             input_path,
             output_dir,
         } => {
-            run_build(input_path, output_dir)?;
+            run_build(input_path, output_dir, config_path)?;
             Ok(())
         }
     }
@@ -831,7 +848,17 @@ fn supports_color() -> bool {
 }
 
 fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
-    let mut args = args.iter();
+    let mut args = args.iter().peekable();
+    while let Some(flag) = args.peek() {
+        match flag.as_str() {
+            "-c" | "--config" => {
+                args.next();
+                let _ = args.next();
+            }
+            _ => break,
+        }
+    }
+
     let command = args.next()?;
 
     match command.as_str() {
@@ -856,7 +883,29 @@ fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<CliCommand> {
+fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand)> {
+    let mut iter = args.iter().peekable();
+    let mut config_path: Option<PathBuf> = None;
+
+    while let Some(flag) = iter.peek() {
+        match flag.as_str() {
+            "-c" | "--config" => {
+                iter.next();
+                let Some(path) = iter.next() else {
+                    bail!("Missing value for --config");
+                };
+                config_path = Some(PathBuf::from(path));
+            }
+            _ => break,
+        }
+    }
+
+    let remaining: Vec<String> = iter.cloned().collect();
+    let command = parse_command(&remaining)?;
+    Ok((config_path, command))
+}
+
+fn parse_command(args: &[String]) -> Result<CliCommand> {
     let mut args = args.iter();
     let Some(command) = args.next() else {
         bail!("Missing command");
@@ -919,9 +968,9 @@ fn parse_args(args: &[String]) -> Result<CliCommand> {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  dossiers serve <path-to-spec-data.json|path-to-spec-directory>");
-    eprintln!("  dossiers prepare <path-to-spec-directory|path-to-spec-data.json>");
-    eprintln!("  dossiers build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
+    eprintln!("  dossiers [-c <config-file>] serve <path-to-spec-data.json|path-to-spec-directory>");
+    eprintln!("  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>");
+    eprintln!("  dossiers [-c <config-file>] build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
 }
 
 fn validate_path(path: String) -> Result<PathBuf> {
@@ -932,13 +981,15 @@ fn validate_path(path: String) -> Result<PathBuf> {
     Ok(input_path)
 }
 
-async fn run_server(input_path: PathBuf) -> Result<()> {
+async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
     let project_root = project_root();
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
 
     let assets = Assets::from_assets_dir(project_root.join("assets"));
-    let site_name = resolve_site_name(&project_root);
+    let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state, static_mounts) = build_app_state(&input_path, site_name, assets)?;
+    let (state, static_mounts) =
+        build_app_state(&input_path, site_name, assets, project_config)?;
 
     println!("Serving specs on http://localhost:8080");
     HttpServer::new(move || {
@@ -964,9 +1015,10 @@ async fn run_server(input_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_prepare(input_path: PathBuf) -> Result<()> {
+fn run_prepare(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
     let project_root = project_root();
-    let (specs, _) = load_and_sort_specs(&input_path)?;
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+    let (specs, _) = load_and_sort_specs(&input_path, &project_config)?;
 
     let prepared: Vec<GeneratedSpec> = specs
         .into_iter()
@@ -986,12 +1038,14 @@ fn run_prepare(input_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_build(input_path: PathBuf, output_dir: PathBuf) -> Result<()> {
+fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
     let project_root = project_root();
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
     let assets = Assets::embedded();
-    let site_name = resolve_site_name(&project_root);
+    let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state_data, static_mounts) = build_app_state(&input_path, site_name, assets)?;
+    let (state_data, static_mounts) =
+        build_app_state(&input_path, site_name, assets, project_config)?;
     let state = state_data.get_ref();
 
     if output_dir.exists() {
@@ -1051,8 +1105,9 @@ fn build_app_state(
     input_path: &Path,
     site_name: String,
     assets: Assets,
+    project_config: ProjectConfiguration,
 ) -> Result<(web::Data<AppState>, Vec<StaticMount>)> {
-    let (specs, static_mounts) = load_and_sort_specs(input_path)?;
+    let (specs, static_mounts) = load_and_sort_specs(input_path, &project_config)?;
     let spec_ids = specs.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
     let renderer = DocRenderer::new();
     let specs_by_id = specs
@@ -2079,9 +2134,21 @@ fn extract_leading_title(source: &str, format: &DocFormat) -> Option<String> {
 
 fn extract_markdown_leading_h1(source: &str) -> Option<String> {
     let mut lines = source.lines().peekable();
+    let mut in_comment = false;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
+        if in_comment {
+            if trimmed.contains("-->") {
+                in_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            in_comment = !trimmed.contains("-->");
+            continue;
+        }
+
         if trimmed.is_empty() {
             continue;
         }
@@ -2089,7 +2156,7 @@ fn extract_markdown_leading_h1(source: &str) -> Option<String> {
         let trimmed_start = line.trim_start();
         if trimmed_start.starts_with('#') {
             let hashes = trimmed_start.chars().take_while(|c| *c == '#').count();
-            if hashes == 1 {
+            if hashes >= 1 {
                 let title = trimmed_start.trim_start_matches('#').trim();
                 if !title.is_empty() {
                     return Some(title.to_string());
@@ -2115,12 +2182,16 @@ fn extract_markdown_leading_h1(source: &str) -> Option<String> {
 fn extract_asciidoc_leading_title(source: &str) -> Option<String> {
     for line in source.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+
         if trimmed.is_empty() {
             continue;
         }
 
         let leading_equals = trimmed.chars().take_while(|c| *c == '=').count();
-        if leading_equals == 1 {
+        if leading_equals >= 1 {
             let title = trimmed.trim_start_matches('=').trim();
             if !title.is_empty() {
                 return Some(title.to_string());
@@ -2194,18 +2265,34 @@ fn find_doc_file(dir: &Path) -> Result<(PathBuf, DocFormat)> {
 fn parse_numeric_date(input: &str) -> Option<i64> {
     lazy_static! {
         static ref NUMERIC_RE: Regex = Regex::new(
-            r"(?xi)^(\d{1,4})[/. -](\d{1,2})[/. -](\d{1,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+            r"(?xi)^\(?(\d{4})-(\d{2})-(\d{2})\)?(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$|^(\d{1,4})[/. -](\d{1,2})[/. -](\d{1,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
         )
         .unwrap();
     }
 
-    let caps = NUMERIC_RE.captures(input.trim())?;
-    let first = caps.get(1)?.as_str();
-    let second = caps.get(2)?.as_str();
-    let third = caps.get(3)?.as_str();
-    let hour = caps.get(4).map(|m| m.as_str());
-    let minute = caps.get(5).map(|m| m.as_str());
-    let second_part = caps.get(6).map(|m| m.as_str());
+    let input_trimmed = input.trim();
+    let caps = NUMERIC_RE.captures(input_trimmed)?;
+
+    // ISO yyyy-mm-dd (with optional parentheses) possibly with time
+    if let (Some(y), Some(m), Some(d)) = (caps.get(1), caps.get(2), caps.get(3)) {
+        let hour = caps.get(4).map(|m| m.as_str());
+        let minute = caps.get(5).map(|m| m.as_str());
+        let second_part = caps.get(6).map(|m| m.as_str());
+        let time = parse_time_parts(hour, minute, second_part);
+        return build_utc_timestamp(
+            y.as_str().parse().ok()?,
+            m.as_str().parse().ok()?,
+            d.as_str().parse().ok()?,
+            time,
+        );
+    }
+
+    let first = caps.get(7)?.as_str();
+    let second = caps.get(8)?.as_str();
+    let third = caps.get(9)?.as_str();
+    let hour = caps.get(10).map(|m| m.as_str());
+    let minute = caps.get(11).map(|m| m.as_str());
+    let second_part = caps.get(12).map(|m| m.as_str());
 
     let time = parse_time_parts(hour, minute, second_part);
 
@@ -2376,7 +2463,7 @@ fn slugify_author(name: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn resolve_site_name(project_root: &Path) -> String {
+fn resolve_site_name(_project_root: &Path, project_config: &ProjectConfiguration) -> String {
     if let Ok(env_name) = std::env::var("SITE_NAME") {
         let trimmed = env_name.trim();
         if !trimmed.is_empty() {
@@ -2384,22 +2471,80 @@ fn resolve_site_name(project_root: &Path) -> String {
         }
     }
 
-    if let Some(name) = read_project_config_name(project_root) {
-        return name;
+    if let Some(name) = project_config.name.clone() {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
     }
 
     "Dossiers".into()
 }
 
-fn read_project_config_name(project_root: &Path) -> Option<String> {
-    let config_path = project_root.join("src/generated/project-config.json");
-    let file = File::open(config_path).ok()?;
-    let value: Value = serde_json::from_reader(file).ok()?;
-    value
-        .get("name")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn load_project_configuration(
+    project_root: &Path,
+    override_path: Option<&Path>,
+) -> ProjectConfiguration {
+    let config_path = override_path
+        .map(|p| p.to_path_buf())
+        .or_else(|| {
+            let rust_toml = project_root.join("rust.toml");
+            if rust_toml.exists() {
+                return Some(rust_toml);
+            }
+            let default = project_root.join("src/generated/project-config.json");
+            if default.exists() {
+                Some(default)
+            } else {
+                None
+            }
+        });
+
+    let Some(path) = config_path else {
+        return ProjectConfiguration::default();
+    };
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to read project configuration at {}: {err}",
+                path.display()
+            );
+            return ProjectConfiguration::default();
+        }
+    };
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    let parsed = match ext.as_deref() {
+        Some("toml") => parse_toml_config(&raw, &path),
+        _ => serde_json::from_str::<Value>(&raw).map_err(|err| err.to_string()),
+    };
+
+    match parsed {
+        Ok(value) => ProjectConfiguration::from_json_value(&value),
+        Err(_) => match parse_toml_config(&raw, &path) {
+            Ok(value) => ProjectConfiguration::from_json_value(&value),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to parse project configuration at {}: {err}",
+                    path.display()
+                );
+                ProjectConfiguration::default()
+            }
+        },
+    }
+}
+
+fn parse_toml_config(raw: &str, path: &Path) -> Result<Value, String> {
+    toml::from_str::<toml::Value>(raw)
+        .map_err(|err| format!("TOML parse error: {err}"))
+        .and_then(|value| serde_json::to_value(value).map_err(|err| err.to_string()))
+        .map_err(|err| format!("failed to parse config {}: {err}", path.display()))
 }
 
 fn project_root() -> PathBuf {
