@@ -28,3 +28,11 @@ serde_yaml = "0.9"
 thiserror = "1"
 unicode-normalization = "0.1"
 toml = "0.8"
+git2 = { version = "0.18", features = ["vendored-libgit2"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "git_timestamps"
+harness = false

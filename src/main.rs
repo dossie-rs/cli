@@ -4,7 +4,6 @@ use std::env;
 use std::fmt::Write;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 mod metadata;
 
@@ -21,6 +20,7 @@ use asciidoc_parser::{
     Parser as AsciidocParser,
 };
 use chrono::{Local, NaiveDate, TimeZone};
+use dossiers::git_utils::{open_git_repository, GitTimestampCache};
 use lazy_static::lazy_static;
 use maud::{html, Markup, PreEscaped};
 use metadata::{
@@ -657,10 +657,12 @@ fn load_specs_from_directory(
     }
 
     let mut specs = Vec::new();
+    let mut pending_specs = Vec::new();
     let mut static_mounts = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let metadata_reader = MetadataReader::new(project_config.clone());
-    let git_root = git_repo_root(dir);
+    let git_repo = open_git_repository(dir);
+    let mut all_git_paths: HashSet<PathBuf> = HashSet::new();
 
     for spec_id in ordered_ids {
         if seen_ids.contains(&spec_id) {
@@ -695,27 +697,78 @@ fn load_specs_from_directory(
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| display_name.clone());
 
-        let git_paths = git_root
-            .as_ref()
-            .map(|_| collect_spec_git_paths(&doc_path, &static_root, &source, format));
-
-        let created = meta.created.as_deref().and_then(parse_date).or_else(|| {
-            if let (Some(git_root), Some(paths)) = (git_root.as_ref(), git_paths.as_ref()) {
-                git_first_commit_timestamp(git_root, paths)
-            } else {
-                None
-            }
+        let git_paths = git_repo.as_ref().map(|repo| {
+            collect_spec_git_paths(&doc_path, &static_root, &source, format)
+                .into_iter()
+                .filter_map(|path| {
+                    path.strip_prefix(repo.workdir())
+                        .map(|p| p.to_path_buf())
+                        .ok()
+                })
+                .collect::<Vec<_>>()
         });
 
-        let mut updated = meta.updated.as_deref().and_then(parse_date);
-
-        if updated.is_none() {
-            if let (Some(git_root), Some(paths)) = (git_root.as_ref(), git_paths.as_ref()) {
-                if let Some(committed) = git_last_commit_timestamp(git_root, paths) {
-                    updated = Some(committed);
-                }
-            }
+        if let Some(paths) = git_paths.as_ref() {
+            all_git_paths.extend(paths.iter().cloned());
         }
+
+        pending_specs.push((
+            spec_id.clone(),
+            dir_name,
+            title,
+            meta.status.unwrap_or_else(|| metadata_reader.default_status()),
+            meta.authors,
+            meta.links,
+            metadata_extra_to_json(&meta.extra),
+            parsed_doc.body,
+            format,
+            meta.created.as_deref().and_then(parse_date),
+            meta.updated.as_deref().and_then(parse_date),
+            git_paths.unwrap_or_default(),
+        ));
+
+        static_mounts.push((format!("/{}", spec_id), static_root));
+    }
+
+    let git_cache = if let Some(repo) = git_repo.as_ref() {
+        if all_git_paths.is_empty() {
+            None
+        } else {
+            Some(GitTimestampCache::from_paths(
+                repo,
+                &all_git_paths.iter().cloned().collect::<Vec<_>>(),
+            ))
+        }
+    } else {
+        None
+    };
+
+    for (
+        id,
+        dir_name,
+        title,
+        status,
+        authors,
+        links,
+        extra,
+        source,
+        format,
+        meta_created,
+        meta_updated,
+        git_paths,
+    ) in pending_specs
+    {
+        let created = meta_created.or_else(|| {
+            git_cache
+                .as_ref()
+                .and_then(|cache| cache.latest_addition(&git_paths))
+        });
+
+        let updated = meta_updated.or_else(|| {
+            git_cache
+                .as_ref()
+                .and_then(|cache| cache.latest_change(&git_paths))
+        });
 
         let updated = updated.or(created);
 
@@ -723,149 +776,26 @@ fn load_specs_from_directory(
             .or(created)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-        let extra = metadata_extra_to_json(&meta.extra);
-
         specs.push(SpecDocument {
-            id: spec_id.clone(),
+            id,
             dir_name,
             title,
-            status: meta
-                .status
-                .unwrap_or_else(|| metadata_reader.default_status()),
+            status,
             created,
             updated,
-            authors: meta.authors,
-            links: meta.links,
+            authors,
+            links,
             updated_sort,
             extra,
-            source: parsed_doc.body,
+            source,
             format,
         });
-
-        static_mounts.push((format!("/{}", spec_id), static_root));
     }
 
     Ok(LoadResult {
         specs,
         static_mounts,
     })
-}
-
-fn git_repo_root(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        return None;
-    }
-
-    let root_path = PathBuf::from(root);
-    root_path.canonicalize().ok().or_else(|| Some(root_path))
-}
-
-fn git_first_commit_timestamp(git_root: &Path, paths: &[PathBuf]) -> Option<i64> {
-    if paths.is_empty() {
-        return None;
-    }
-
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(git_root)
-        .arg("log")
-        .arg("--diff-filter=A")
-        .arg("--format=%cI")
-        .arg("-1")
-        .arg("--");
-
-    let mut has_paths = false;
-
-    for path in paths {
-        let absolute = path
-            .canonicalize()
-            .ok()
-            .unwrap_or_else(|| path.to_path_buf());
-        let relative = absolute
-            .strip_prefix(git_root)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| absolute);
-        command.arg(relative);
-        has_paths = true;
-    }
-
-    if !has_paths {
-        return None;
-    }
-
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let timestamp = stdout.lines().next().unwrap_or("").trim();
-    if timestamp.is_empty() {
-        return None;
-    }
-
-    parse_date(timestamp)
-}
-
-fn git_last_commit_timestamp(git_root: &Path, paths: &[PathBuf]) -> Option<i64> {
-    if paths.is_empty() {
-        return None;
-    }
-
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(git_root)
-        .arg("log")
-        .arg("-1")
-        .arg("--format=%cI")
-        .arg("--");
-
-    let mut has_paths = false;
-
-    for path in paths {
-        let absolute = path
-            .canonicalize()
-            .ok()
-            .unwrap_or_else(|| path.to_path_buf());
-        let relative = absolute
-            .strip_prefix(git_root)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| absolute);
-        command.arg(relative);
-        has_paths = true;
-    }
-
-    if !has_paths {
-        return None;
-    }
-
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let timestamp = stdout.lines().next().unwrap_or("").trim();
-    if timestamp.is_empty() {
-        return None;
-    }
-
-    parse_date(timestamp)
 }
 
 fn collect_spec_git_paths(
