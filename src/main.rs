@@ -4,6 +4,7 @@ use std::env;
 use std::fmt::Write;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 mod metadata;
 
@@ -526,9 +527,7 @@ where
 
 fn metadata_extra_to_json(map: &HashMap<String, MetadataValue>) -> HashMap<String, Value> {
     map.iter()
-        .filter_map(|(k, v)| {
-            metadata_value_to_json(v).map(|vv| (k.clone(), vv))
-        })
+        .filter_map(|(k, v)| metadata_value_to_json(v).map(|vv| (k.clone(), vv)))
         .collect()
 }
 
@@ -645,9 +644,7 @@ fn load_specs_from_directory(
                     .and_then(|stem| stem.to_str())
                     .unwrap_or(&name)
                     .to_string();
-                file_locations
-                    .entry(id)
-                    .or_insert((dir_name, path, format));
+                file_locations.entry(id).or_insert((dir_name, path, format));
             }
         }
     }
@@ -663,6 +660,7 @@ fn load_specs_from_directory(
     let mut static_mounts = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let metadata_reader = MetadataReader::new(project_config.clone());
+    let git_root = git_repo_root(dir);
 
     for spec_id in ordered_ids {
         if seen_ids.contains(&spec_id) {
@@ -671,25 +669,19 @@ fn load_specs_from_directory(
         let file_entry = file_locations.get(&spec_id);
         let dir_entry = dir_locations.get(&spec_id);
 
-        let (dir_name, doc_path, format, static_root) = if let Some((dir_name, path, format)) =
-            file_entry
-        {
-            let static_root = dir_entry
-                .map(|(_, path)| path.clone())
-                .or_else(|| path.parent().map(|p| p.to_path_buf()))
-                .unwrap_or_else(|| dir.to_path_buf());
-            (
-                dir_name.clone(),
-                path.clone(),
-                *format,
-                static_root,
-            )
-        } else if let Some((dir_name, path)) = dir_entry {
-            let (doc_path, format) = find_doc_file(path)?;
-            (dir_name.clone(), doc_path, format, path.clone())
-        } else {
-            continue;
-        };
+        let (dir_name, doc_path, format, static_root) =
+            if let Some((dir_name, path, format)) = file_entry {
+                let static_root = dir_entry
+                    .map(|(_, path)| path.clone())
+                    .or_else(|| path.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| dir.to_path_buf());
+                (dir_name.clone(), path.clone(), *format, static_root)
+            } else if let Some((dir_name, path)) = dir_entry {
+                let (doc_path, format) = find_doc_file(path)?;
+                (dir_name.clone(), doc_path, format, path.clone())
+            } else {
+                continue;
+            };
         seen_ids.insert(spec_id.clone());
         let source = fs::read_to_string(&doc_path)
             .with_context(|| format!("Reading spec document at {}", doc_path.display()))?;
@@ -703,8 +695,29 @@ fn load_specs_from_directory(
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| display_name.clone());
 
-        let created = meta.created.as_deref().and_then(parse_date);
-        let updated = meta.updated.as_deref().and_then(parse_date).or(created);
+        let git_paths = git_root
+            .as_ref()
+            .map(|_| collect_spec_git_paths(&doc_path, &static_root, &source, format));
+
+        let created = meta.created.as_deref().and_then(parse_date).or_else(|| {
+            if let (Some(git_root), Some(paths)) = (git_root.as_ref(), git_paths.as_ref()) {
+                git_first_commit_timestamp(git_root, paths)
+            } else {
+                None
+            }
+        });
+
+        let mut updated = meta.updated.as_deref().and_then(parse_date);
+
+        if updated.is_none() {
+            if let (Some(git_root), Some(paths)) = (git_root.as_ref(), git_paths.as_ref()) {
+                if let Some(committed) = git_last_commit_timestamp(git_root, paths) {
+                    updated = Some(committed);
+                }
+            }
+        }
+
+        let updated = updated.or(created);
 
         let updated_sort = updated
             .or(created)
@@ -738,6 +751,157 @@ fn load_specs_from_directory(
     })
 }
 
+fn git_repo_root(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+
+    let root_path = PathBuf::from(root);
+    root_path.canonicalize().ok().or_else(|| Some(root_path))
+}
+
+fn git_first_commit_timestamp(git_root: &Path, paths: &[PathBuf]) -> Option<i64> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(git_root)
+        .arg("log")
+        .arg("--diff-filter=A")
+        .arg("--format=%cI")
+        .arg("-1")
+        .arg("--");
+
+    let mut has_paths = false;
+
+    for path in paths {
+        let absolute = path
+            .canonicalize()
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf());
+        let relative = absolute
+            .strip_prefix(git_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| absolute);
+        command.arg(relative);
+        has_paths = true;
+    }
+
+    if !has_paths {
+        return None;
+    }
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let timestamp = stdout.lines().next().unwrap_or("").trim();
+    if timestamp.is_empty() {
+        return None;
+    }
+
+    parse_date(timestamp)
+}
+
+fn git_last_commit_timestamp(git_root: &Path, paths: &[PathBuf]) -> Option<i64> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(git_root)
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%cI")
+        .arg("--");
+
+    let mut has_paths = false;
+
+    for path in paths {
+        let absolute = path
+            .canonicalize()
+            .ok()
+            .unwrap_or_else(|| path.to_path_buf());
+        let relative = absolute
+            .strip_prefix(git_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| absolute);
+        command.arg(relative);
+        has_paths = true;
+    }
+
+    if !has_paths {
+        return None;
+    }
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let timestamp = stdout.lines().next().unwrap_or("").trim();
+    if timestamp.is_empty() {
+        return None;
+    }
+
+    parse_date(timestamp)
+}
+
+fn collect_spec_git_paths(
+    doc_path: &Path,
+    static_root: &Path,
+    source: &str,
+    format: DocFormat,
+) -> Vec<PathBuf> {
+    let doc = doc_path
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| doc_path.to_path_buf());
+    let root = static_root
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| static_root.to_path_buf());
+
+    let mut paths: HashSet<PathBuf> = HashSet::new();
+    paths.insert(doc);
+
+    if let Ok(rendered) = DocRenderer::new().render(source, format) {
+        for asset in collect_doc_assets(&rendered) {
+            let asset_path = root.join(&asset);
+            let resolved = asset_path
+                .canonicalize()
+                .ok()
+                .unwrap_or_else(|| asset_path.to_path_buf());
+            if resolved.exists() {
+                paths.insert(resolved);
+            }
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
 fn load_specs(input_path: &Path, project_config: &ProjectConfiguration) -> Result<LoadResult> {
     if input_path.is_dir() {
         load_specs_from_directory(input_path, project_config)
@@ -746,11 +910,40 @@ fn load_specs(input_path: &Path, project_config: &ProjectConfiguration) -> Resul
     }
 }
 
+fn resolve_spec_input_path(input_path: &Path, project_config: &ProjectConfiguration) -> PathBuf {
+    if !input_path.is_dir() {
+        return input_path.to_path_buf();
+    }
+
+    let Some(subdir) = project_config.subdirectory.as_ref() else {
+        return input_path.to_path_buf();
+    };
+
+    let subdir_path = PathBuf::from(subdir);
+    let candidate = if subdir_path.is_absolute() {
+        subdir_path
+    } else {
+        input_path.join(subdir_path)
+    };
+
+    if candidate.exists() {
+        candidate
+    } else {
+        eprintln!(
+            "Warning: configured subdirectory '{}' not found under {}",
+            subdir,
+            input_path.display()
+        );
+        input_path.to_path_buf()
+    }
+}
+
 fn load_and_sort_specs(
     input_path: &Path,
     project_config: &ProjectConfiguration,
 ) -> Result<(Vec<SpecDocument>, Vec<StaticMount>)> {
-    let mut load_result = load_specs(input_path, project_config)?;
+    let input_root = resolve_spec_input_path(input_path, project_config);
+    let mut load_result = load_specs(&input_root, project_config)?;
     load_result.specs.sort_by(|a, b| {
         b.updated_sort
             .cmp(&a.updated_sort)

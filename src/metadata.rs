@@ -74,7 +74,6 @@ pub enum MetadataValueType {
     Markdown,
 }
 
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum MetadataValue {
@@ -148,27 +147,26 @@ impl MetadataReader {
         }
 
         if !parsed_frontmatter {
-        if let Some((mut pairs, remaining)) = parse_leading_unordered_list(source) {
-            if matches!(format, DocFormat::Markdown) {
-                for (key, value) in pairs.iter_mut() {
-                    if self.is_markdown_extra_field(key) {
-                        continue;
+            if let Some((mut pairs, remaining)) = parse_leading_unordered_list(source) {
+                if matches!(format, DocFormat::Markdown) {
+                    for (key, value) in pairs.iter_mut() {
+                        if self.is_markdown_extra_field(key) {
+                            continue;
+                        }
+                        *value = markdown_plain_text(value);
                     }
-                    *value = markdown_plain_text(value);
                 }
-            }
-            self.apply_pairs(&mut metadata, pairs);
-            body = remaining;
-            parsed_list = true;
+                self.apply_pairs(&mut metadata, pairs);
+                body = remaining;
+                parsed_list = true;
             } else {
                 self.apply_attribute_lines(source, &mut metadata);
             }
         }
 
-        if metadata.title.is_none() && parsed_list
-            && !fallback_title.is_empty() {
-                metadata.title = Some(fallback_title.to_string());
-            }
+        if metadata.title.is_none() && parsed_list && !fallback_title.is_empty() {
+            metadata.title = Some(fallback_title.to_string());
+        }
 
         if metadata.title.is_none() {
             metadata.title = extract_leading_title(&body, &format)
@@ -177,10 +175,6 @@ impl MetadataReader {
 
         if metadata.status.is_none() {
             metadata.status = Some(self.default_status());
-        }
-
-        if metadata.updated.is_none() {
-            metadata.updated = metadata.created.clone();
         }
 
         metadata.authors = normalize_authors(metadata.authors);
