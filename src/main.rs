@@ -22,7 +22,9 @@ use asciidoc_parser::{
 use chrono::{Local, NaiveDate, TimeZone};
 use lazy_static::lazy_static;
 use maud::{html, Markup, PreEscaped};
-use metadata::{MetadataReader, ProjectConfiguration};
+use metadata::{
+    ExtraMetadataField, MetadataReader, MetadataValue, MetadataValueType, ProjectConfiguration,
+};
 use pulldown_cmark::{html as md_html, Options as MdOptions, Parser};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,8 @@ struct GeneratedSpec {
     links: Vec<Link>,
     #[serde(default)]
     updated_sort: Option<Value>,
+    #[serde(default)]
+    extra: HashMap<String, Value>,
     source: String,
     format: String,
 }
@@ -85,6 +89,7 @@ struct SpecDocument {
     authors: Vec<String>,
     links: Vec<Link>,
     updated_sort: i64,
+    extra: HashMap<String, Value>,
     source: String,
     format: DocFormat,
 }
@@ -264,6 +269,7 @@ struct AppState {
     display_prefix: String,
     site_name: String,
     site_description: String,
+    extra_fields: Vec<ExtraMetadataField>,
     assets: Assets,
     renderer: DocRenderer,
 }
@@ -518,6 +524,54 @@ where
         .collect()
 }
 
+fn metadata_extra_to_json(map: &HashMap<String, MetadataValue>) -> HashMap<String, Value> {
+    map.iter()
+        .filter_map(|(k, v)| {
+            metadata_value_to_json(v).map(|vv| (k.clone(), vv))
+        })
+        .collect()
+}
+
+fn metadata_value_to_json(value: &MetadataValue) -> Option<Value> {
+    match value {
+        MetadataValue::String(s) => Some(Value::String(s.clone())),
+        MetadataValue::Number(n) => Number::from_f64(*n).map(Value::Number),
+        MetadataValue::Boolean(b) => Some(Value::Bool(*b)),
+    }
+}
+
+fn display_extra_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn url_escape_component(raw: &str) -> String {
+    const UNRESERVED: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+    let mut encoded = String::new();
+    for ch in raw.chars() {
+        if UNRESERVED.contains(ch) {
+            encoded.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}
+
 fn load_specs_from_json(path: &Path, _config: &ProjectConfiguration) -> Result<LoadResult> {
     let raw_specs: Vec<GeneratedSpec> = serde_json::from_reader(
         File::open(path).with_context(|| format!("Opening {}", path.display()))?,
@@ -651,6 +705,8 @@ fn load_specs_from_directory(
             .or(created)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+        let extra = metadata_extra_to_json(&meta.extra);
+
         specs.push(SpecDocument {
             id: spec_id.clone(),
             dir_name,
@@ -663,6 +719,7 @@ fn load_specs_from_directory(
             authors: meta.authors,
             links: meta.links,
             updated_sort,
+            extra,
             source: parsed_doc.body,
             format,
         });
@@ -709,6 +766,7 @@ fn spec_document_to_generated_spec(spec: SpecDocument) -> GeneratedSpec {
         authors: spec.authors,
         links: spec.links,
         updated_sort: Some(Value::Number(Number::from(spec.updated_sort))),
+        extra: spec.extra,
         source: spec.source,
         format: match spec.format {
             DocFormat::Markdown => "markdown".to_string(),
@@ -997,6 +1055,10 @@ fn project_root_from(config_path: Option<&Path>, input_path: &Path) -> PathBuf {
         }
     }
 
+    if input_path.is_dir() {
+        return input_path.to_path_buf();
+    }
+
     input_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -1144,6 +1206,7 @@ fn build_app_state(
         display_prefix: project_config.prefix.clone().unwrap_or_default(),
         site_name,
         site_description: project_config.description.unwrap_or_default(),
+        extra_fields: project_config.extra_metadata_fields.clone(),
         assets,
         renderer,
     });
@@ -1432,12 +1495,37 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     };
     let title = format!("{display_id} {} - {}", spec.title, state.site_name);
     let description = format!("Rendered specification {}", spec.dir_name);
-
     let links: Vec<(&str, &str)> = spec
         .links
         .iter()
         .map(|link| (link.label.as_str(), link.href.as_str()))
         .collect();
+    let extra_pairs = state
+        .extra_fields
+        .iter()
+        .filter_map(|field| {
+            spec.extra.get(&field.name).map(|value| {
+                let label = field
+                    .display_name
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| field.name.clone());
+                let display = display_extra_value(value);
+                let link = match (&field.link_format, value, field.type_hint) {
+                    (Some(fmt), Value::String(raw), MetadataValueType::String)
+                        if !raw.is_empty() =>
+                    {
+                        let encoded = url_escape_component(raw);
+                        Some(fmt.replace("{value}", &encoded))
+                    }
+                    _ => None,
+                };
+                (label, display, link)
+            })
+        })
+        .filter(|(_, v, _)| !v.is_empty())
+        .collect::<Vec<_>>();
 
     let mini_toc_js = state.assets.mini_toc_script();
     let content = html! {
@@ -1483,6 +1571,19 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                         @for (index, (label, href)) in links.iter().enumerate() {
                             @if index > 0 { span class="meta-divider" { "•" } }
                             a class="spec-metadata-link" href=(*href) target="_blank" rel="noreferrer noopener" { (label) }
+                        }
+                    }
+                }
+            }
+
+            @for (key, value, link) in extra_pairs {
+                div class="spec-header" {
+                    span class="meta-label" { (key) }
+                    span {
+                        @if let Some(href) = link {
+                            a class="spec-metadata-link" href=(href) target="_blank" rel="noreferrer noopener" { (value) }
+                        } @else {
+                            (value)
                         }
                     }
                 }
@@ -1696,6 +1797,7 @@ fn spec_from_generated(spec: GeneratedSpec) -> Result<SpecDocument> {
         authors: normalize_authors(spec.authors),
         links: spec.links,
         updated_sort,
+        extra: spec.extra,
         source,
         format,
     })

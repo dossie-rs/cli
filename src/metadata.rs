@@ -299,6 +299,7 @@ impl MetadataReader {
                         yaml_value_to_string(value).filter(|v| !self.is_empty_value(v))
                     {
                         metadata.initial_release = Some(initial);
+                        self.apply_extra_value(metadata, key_str, value);
                     }
                     continue;
                 }
@@ -389,6 +390,7 @@ impl MetadataReader {
             "initialrelease" => {
                 if !self.is_empty_value(value) {
                     metadata.initial_release = Some(value.to_string());
+                    self.apply_extra_value_from_str(metadata, &canonical, value);
                 }
                 return;
             }
