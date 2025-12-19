@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use pulldown_cmark::{Event, Parser};
+use pulldown_cmark::{html as md_html, Event, Options as MdOptions, Parser};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -71,6 +71,7 @@ pub enum MetadataValueType {
     Number,
     Boolean,
     Date,
+    Markdown,
 }
 
 
@@ -80,6 +81,7 @@ pub enum MetadataValue {
     String(String),
     Number(f64),
     Boolean(bool),
+    Markdown(String),
 }
 
 pub struct MetadataReader {
@@ -146,15 +148,18 @@ impl MetadataReader {
         }
 
         if !parsed_frontmatter {
-            if let Some((mut pairs, remaining)) = parse_leading_unordered_list(source) {
-                if matches!(format, DocFormat::Markdown) {
-                    for (_, value) in pairs.iter_mut() {
-                        *value = markdown_plain_text(value);
+        if let Some((mut pairs, remaining)) = parse_leading_unordered_list(source) {
+            if matches!(format, DocFormat::Markdown) {
+                for (key, value) in pairs.iter_mut() {
+                    if self.is_markdown_extra_field(key) {
+                        continue;
                     }
+                    *value = markdown_plain_text(value);
                 }
-                self.apply_pairs(&mut metadata, pairs);
-                body = remaining;
-                parsed_list = true;
+            }
+            self.apply_pairs(&mut metadata, pairs);
+            body = remaining;
+            parsed_list = true;
             } else {
                 self.apply_attribute_lines(source, &mut metadata);
             }
@@ -478,6 +483,13 @@ impl MetadataReader {
             .empty_values
             .iter()
             .any(|v| normalized == v.to_ascii_lowercase())
+    }
+
+    fn is_markdown_extra_field(&self, key: &str) -> bool {
+        self.config
+            .extra_metadata_fields
+            .iter()
+            .any(|field| field.type_hint == MetadataValueType::Markdown && field.matches(key))
     }
 }
 
@@ -914,6 +926,8 @@ fn parse_typed_yaml_value(value: &YamlValue, kind: MetadataValueType) -> Option<
             .as_f64()
             .or_else(|| value.as_i64().map(|v| v as f64))
             .map(MetadataValue::Number),
+        MetadataValueType::Markdown => yaml_value_to_string(value)
+            .map(|raw| MetadataValue::Markdown(render_markdown_html(&raw))),
     }
 }
 
@@ -933,6 +947,7 @@ fn parse_typed_str_value(value: &str, kind: MetadataValueType) -> Option<Metadat
             _ => None,
         },
         MetadataValueType::Number => trimmed.parse::<f64>().ok().map(MetadataValue::Number),
+        MetadataValueType::Markdown => Some(MetadataValue::Markdown(render_markdown_html(trimmed))),
     }
 }
 
@@ -975,6 +990,16 @@ fn sanitize_frontmatter_block(block: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_markdown_html(source: &str) -> String {
+    let mut options = MdOptions::empty();
+    options.insert(MdOptions::ENABLE_TABLES);
+    options.insert(MdOptions::ENABLE_FOOTNOTES);
+    let parser = Parser::new_ext(source, options);
+    let mut html = String::new();
+    md_html::push_html(&mut html, parser);
+    html
 }
 
 #[cfg(test)]
@@ -1082,5 +1107,63 @@ Body content
         let result = reader.read(doc, DocFormat::Markdown, "fallback");
 
         assert_eq!(result.metadata.title.as_deref(), Some("async_fn_in_trait"));
+    }
+
+    #[test]
+    fn parses_markdown_extra_field_from_yaml_frontmatter() {
+        let doc = r#"---
+summary: |
+  This is **bold** and _emphasized_.
+---
+
+Body
+"#;
+
+        let mut config = ProjectConfiguration::default();
+        config.extra_metadata_fields.push(ExtraMetadataField {
+            name: "summary".into(),
+            type_hint: MetadataValueType::Markdown,
+            required: false,
+            display_name: None,
+            link_format: None,
+            aliases: vec![],
+        });
+
+        let reader = MetadataReader::new(config);
+        let result = reader.read(doc, DocFormat::Markdown, "fallback");
+
+        match result.metadata.extra.get("summary") {
+            Some(MetadataValue::Markdown(html)) => {
+                assert!(html.contains("<strong>bold</strong>"));
+                assert!(html.contains("<em>emphasized</em>"));
+            }
+            other => panic!("expected markdown extra metadata, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_markdown_extra_field_from_markdown_frontmatter_list() {
+        let doc = "- summary: Intro with **bold** detail\n\nBody";
+
+        let mut config = ProjectConfiguration::default();
+        config.extra_metadata_fields.push(ExtraMetadataField {
+            name: "summary".into(),
+            type_hint: MetadataValueType::Markdown,
+            required: false,
+            display_name: None,
+            link_format: None,
+            aliases: vec![],
+        });
+
+        let reader = MetadataReader::new(config);
+        let result = reader.read(doc, DocFormat::Markdown, "fallback");
+
+        match result.metadata.extra.get("summary") {
+            Some(MetadataValue::Markdown(html)) => {
+                assert!(html.contains("<strong>bold</strong>"));
+                assert!(html.starts_with("<p>Intro with"));
+            }
+            other => panic!("expected markdown extra metadata, got {:?}", other),
+        }
     }
 }

@@ -273,6 +273,27 @@ main {
   align-self: flex-end;
 }
 
+.meta-value {
+  flex: 1;
+  min-width: 0;
+}
+
+.meta-value--markdown {
+  line-height: 1.5;
+}
+
+.meta-value--markdown p {
+  margin: 0.15rem 0;
+}
+
+.meta-value--markdown p:first-child {
+  margin-top: 0;
+}
+
+.meta-value--markdown p:last-child {
+  margin-bottom: 0;
+}
+
 .meta-divider {
   color: var(--muted);
 }

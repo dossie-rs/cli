@@ -537,6 +537,7 @@ fn metadata_value_to_json(value: &MetadataValue) -> Option<Value> {
         MetadataValue::String(s) => Some(Value::String(s.clone())),
         MetadataValue::Number(n) => Number::from_f64(*n).map(Value::Number),
         MetadataValue::Boolean(b) => Some(Value::Bool(*b)),
+        MetadataValue::Markdown(html) => Some(Value::String(html.clone())),
     }
 }
 
@@ -1512,6 +1513,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                     .cloned()
                     .unwrap_or_else(|| field.name.clone());
                 let display = display_extra_value(value);
+                let is_html = field.type_hint == MetadataValueType::Markdown;
                 let link = match (&field.link_format, value, field.type_hint) {
                     (Some(fmt), Value::String(raw), MetadataValueType::String)
                         if !raw.is_empty() =>
@@ -1521,10 +1523,10 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                     }
                     _ => None,
                 };
-                (label, display, link)
+                (label, display, link, is_html)
             })
         })
-        .filter(|(_, v, _)| !v.is_empty())
+        .filter(|(_, v, _, _)| !v.is_empty())
         .collect::<Vec<_>>();
 
     let mini_toc_js = state.assets.mini_toc_script();
@@ -1576,15 +1578,15 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                 }
             }
 
-            @for (key, value, link) in extra_pairs {
+            @for (key, value, link, is_html) in extra_pairs {
                 div class="spec-header" {
                     span class="meta-label" { (key) }
-                    span {
-                        @if let Some(href) = link {
-                            a class="spec-metadata-link" href=(href) target="_blank" rel="noreferrer noopener" { (value) }
-                        } @else {
-                            (value)
-                        }
+                    @if let Some(href) = link {
+                        a class="spec-metadata-link meta-value" href=(href) target="_blank" rel="noreferrer noopener" { (value) }
+                    } @else if is_html {
+                        div class="meta-value meta-value--markdown" { (PreEscaped(value)) }
+                    } @else {
+                        span class="meta-value" { (value) }
                     }
                 }
             }
