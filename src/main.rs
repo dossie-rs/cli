@@ -601,14 +601,10 @@ fn load_specs_from_directory(
         bail!("Provided path is not a directory: {}", dir.display());
     }
 
-    #[derive(Debug)]
-    enum SpecLocation {
-        Directory(PathBuf),
-        File { path: PathBuf, format: DocFormat },
-    }
-
-    let mut spec_locations: Vec<(String, String, SpecLocation)> = Vec::new();
-    let mut file_spec_ids: HashSet<String> = HashSet::new();
+    let mut dir_locations: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let mut file_locations: HashMap<String, (String, PathBuf, DocFormat)> = HashMap::new();
+    let mut ordered_ids = Vec::new();
+    let mut discovered_ids: HashSet<String> = HashSet::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -621,8 +617,12 @@ fn load_specs_from_directory(
             continue;
         };
 
+        if discovered_ids.insert(id.clone()) {
+            ordered_ids.push(id.clone());
+        }
+
         if path.is_dir() {
-            spec_locations.push((id, name, SpecLocation::Directory(path)));
+            dir_locations.entry(id).or_insert((name, path));
             continue;
         }
 
@@ -640,18 +640,19 @@ fn load_specs_from_directory(
             };
 
             if let Some(format) = format {
-                file_spec_ids.insert(id.clone());
                 let dir_name = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .unwrap_or(&name)
                     .to_string();
-                spec_locations.push((id, dir_name, SpecLocation::File { path, format }));
+                file_locations
+                    .entry(id)
+                    .or_insert((dir_name, path, format));
             }
         }
     }
 
-    if spec_locations.is_empty() {
+    if dir_locations.is_empty() && file_locations.is_empty() {
         bail!(
             "No spec documents found in {} (expected subdirectories like 0001-* or files like 0001-*.md)",
             dir.display()
@@ -663,28 +664,31 @@ fn load_specs_from_directory(
     let mut seen_ids: HashSet<String> = HashSet::new();
     let metadata_reader = MetadataReader::new(project_config.clone());
 
-    for (spec_id, dir_name, location) in spec_locations {
+    for spec_id in ordered_ids {
         if seen_ids.contains(&spec_id) {
             continue;
         }
-        let (doc_path, format, static_root) = match location {
-            SpecLocation::Directory(path) => match find_doc_file(&path) {
-                Ok((doc_path, format)) => (doc_path, format, path),
-                Err(err) => {
-                    // If there's a file-based spec with the same ID, this directory is likely assets-only.
-                    if file_spec_ids.contains(&spec_id) {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            },
-            SpecLocation::File { path, format } => {
-                let static_root = path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| dir.to_path_buf());
-                (path, format, static_root)
-            }
+        let file_entry = file_locations.get(&spec_id);
+        let dir_entry = dir_locations.get(&spec_id);
+
+        let (dir_name, doc_path, format, static_root) = if let Some((dir_name, path, format)) =
+            file_entry
+        {
+            let static_root = dir_entry
+                .map(|(_, path)| path.clone())
+                .or_else(|| path.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| dir.to_path_buf());
+            (
+                dir_name.clone(),
+                path.clone(),
+                *format,
+                static_root,
+            )
+        } else if let Some((dir_name, path)) = dir_entry {
+            let (doc_path, format) = find_doc_file(path)?;
+            (dir_name.clone(), doc_path, format, path.clone())
+        } else {
+            continue;
         };
         seen_ids.insert(spec_id.clone());
         let source = fs::read_to_string(&doc_path)
