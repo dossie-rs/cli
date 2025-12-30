@@ -181,9 +181,8 @@ impl MetadataReader {
 
     pub(crate) fn default_status(&self) -> String {
         self.config
-            .new_status
+            .default_status
             .clone()
-            .or_else(|| self.config.default_status.clone())
             .or_else(|| self.config.statuses.first().cloned())
             .unwrap_or_else(|| "DRAFT".to_string())
     }
