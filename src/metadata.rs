@@ -176,10 +176,6 @@ impl MetadataReader {
                 .or_else(|| Some(fallback_title.to_string()).filter(|value| !value.is_empty()));
         }
 
-        if metadata.status.is_none() {
-            metadata.status = Some(self.default_status());
-        }
-
         metadata.authors = normalize_authors(metadata.authors);
 
         MetadataReadResult { metadata, body }
@@ -190,7 +186,25 @@ impl MetadataReader {
             .default_status
             .clone()
             .or_else(|| self.config.statuses.first().cloned())
+            .unwrap_or_else(|| "PUBLISHED".to_string())
+    }
+
+    pub(crate) fn new_status(&self) -> String {
+        self.config
+            .new_status
+            .clone()
+            .or_else(|| self.config.statuses.first().cloned())
             .unwrap_or_else(|| "DRAFT".to_string())
+    }
+
+    pub(crate) fn resolve_status(&self, provided: Option<String>, git_managed: bool) -> String {
+        provided.unwrap_or_else(|| {
+            if git_managed {
+                self.default_status()
+            } else {
+                self.new_status()
+            }
+        })
     }
 
     fn parse_frontmatter(&self, source: &str, format: DocFormat) -> Option<(YamlMapping, String)> {
@@ -1087,5 +1101,22 @@ Body
             }
             other => panic!("expected markdown extra metadata, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn resolves_default_status_for_git_managed_docs() {
+        let reader = MetadataReader::new(ProjectConfiguration::default());
+        let status = reader.resolve_status(None, true);
+        assert_eq!(status, "PUBLISHED");
+    }
+
+    #[test]
+    fn resolves_new_status_for_untracked_docs() {
+        let mut config = ProjectConfiguration::default();
+        config.new_status = Some("PROPOSED".into());
+
+        let reader = MetadataReader::new(config);
+        let status = reader.resolve_status(None, false);
+        assert_eq!(status, "PROPOSED");
     }
 }

@@ -95,6 +95,22 @@ struct SpecDocument {
     format: DocFormat,
 }
 
+#[derive(Debug)]
+struct PendingSpec {
+    id: String,
+    dir_name: String,
+    title: String,
+    status: Option<String>,
+    authors: Vec<String>,
+    links: Vec<Link>,
+    extra: HashMap<String, Value>,
+    body: String,
+    format: DocFormat,
+    meta_created: Option<i64>,
+    meta_updated: Option<i64>,
+    git_paths: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 struct Assets {
     css_source: CssSource,
@@ -657,7 +673,7 @@ fn load_specs_from_directory(
     }
 
     let mut specs = Vec::new();
-    let mut pending_specs = Vec::new();
+    let mut pending_specs: Vec<PendingSpec> = Vec::new();
     let mut static_mounts = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let metadata_reader = MetadataReader::new(project_config.clone());
@@ -712,20 +728,20 @@ fn load_specs_from_directory(
             all_git_paths.extend(paths.iter().cloned());
         }
 
-        pending_specs.push((
-            spec_id.clone(),
+        pending_specs.push(PendingSpec {
+            id: spec_id.clone(),
             dir_name,
             title,
-            meta.status.unwrap_or_else(|| metadata_reader.default_status()),
-            meta.authors,
-            meta.links,
-            metadata_extra_to_json(&meta.extra),
-            parsed_doc.body,
+            status: meta.status,
+            authors: meta.authors,
+            links: meta.links,
+            extra: metadata_extra_to_json(&meta.extra),
+            body: parsed_doc.body,
             format,
-            meta.created.as_deref().and_then(parse_date),
-            meta.updated.as_deref().and_then(parse_date),
-            git_paths.unwrap_or_default(),
-        ));
+            meta_created: meta.created.as_deref().and_then(parse_date),
+            meta_updated: meta.updated.as_deref().and_then(parse_date),
+            git_paths: git_paths.unwrap_or_default(),
+        });
 
         static_mounts.push((format!("/{}", spec_id), static_root));
     }
@@ -743,52 +759,46 @@ fn load_specs_from_directory(
         None
     };
 
-    for (
-        id,
-        dir_name,
-        title,
-        status,
-        authors,
-        links,
-        extra,
-        source,
-        format,
-        meta_created,
-        meta_updated,
-        git_paths,
-    ) in pending_specs
-    {
-        let created = meta_created.or_else(|| {
-            git_cache
-                .as_ref()
-                .and_then(|cache| cache.latest_addition(&git_paths))
-        });
+    for pending in pending_specs {
+        let (git_addition, git_change) = git_cache
+            .as_ref()
+            .map(|cache| {
+                (
+                    cache.latest_addition(&pending.git_paths),
+                    cache.latest_change(&pending.git_paths),
+                )
+            })
+            .unwrap_or((None, None));
 
-        let updated = meta_updated.or_else(|| {
-            git_cache
-                .as_ref()
-                .and_then(|cache| cache.latest_change(&git_paths))
-        });
+        let created = pending
+            .meta_created
+            .or(git_addition);
 
-        let updated = updated.or(created);
+        let updated = pending
+            .meta_updated
+            .or(git_change)
+            .or(created);
 
         let updated_sort = updated
             .or(created)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+        let git_managed = git_repo.is_some() && (git_addition.is_some() || git_change.is_some());
+        let status = metadata_reader.resolve_status(pending.status.clone(), git_managed);
+
         specs.push(SpecDocument {
-            id,
-            dir_name,
-            title,
+            id: pending.id,
+            dir_name: pending.dir_name,
+            title: pending.title,
             status,
             created,
             updated,
-            authors,
-            links,
+            authors: pending.authors,
+            links: pending.links,
             updated_sort,
-            extra,
-            source,
-            format,
+            extra: pending.extra,
+            source: pending.body,
+            format: pending.format,
         });
     }
 
