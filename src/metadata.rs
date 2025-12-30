@@ -1112,10 +1112,10 @@ Body
 
     #[test]
     fn resolves_new_status_for_untracked_docs() {
-        let mut config = ProjectConfiguration::default();
-        config.new_status = Some("PROPOSED".into());
-
-        let reader = MetadataReader::new(config);
+        let reader = MetadataReader::new(ProjectConfiguration {
+            new_status: Some("PROPOSED".into()),
+            ..ProjectConfiguration::default()
+        });
         let status = reader.resolve_status(None, false);
         assert_eq!(status, "PROPOSED");
     }
