@@ -17,9 +17,6 @@ pub struct DocumentMetadata {
     pub updated: Option<String>,
     pub authors: Vec<String>,
     pub links: Vec<Link>,
-    pub target_milestone: Option<String>,
-    pub issue: Option<String>,
-    pub initial_release: Option<String>,
     pub extra: HashMap<String, MetadataValue>,
 }
 
@@ -271,37 +268,6 @@ impl MetadataReader {
             }
 
             match canonical.as_str() {
-                "issue" | "githubissue" | "confluencelink" => {
-                    if let Some(issue) =
-                        yaml_value_to_string(value).filter(|v| !self.is_empty_value(v))
-                    {
-                        if !issue.is_empty() {
-                            metadata.issue = Some(issue.clone());
-                            metadata.links.push(Link {
-                                label: "Issue".to_string(),
-                                href: issue,
-                            });
-                        }
-                    }
-                    continue;
-                }
-                "targetmilestone" | "milestone" => {
-                    if let Some(target) =
-                        yaml_value_to_string(value).filter(|v| !self.is_empty_value(v))
-                    {
-                        metadata.target_milestone = Some(target);
-                    }
-                    continue;
-                }
-                "initialrelease" => {
-                    if let Some(initial) =
-                        yaml_value_to_string(value).filter(|v| !self.is_empty_value(v))
-                    {
-                        metadata.initial_release = Some(initial);
-                        self.apply_extra_value(metadata, key_str, value);
-                    }
-                    continue;
-                }
                 "authors" | "author" => {
                     if let Some(authors) = parse_authors_from_yaml(value) {
                         metadata.authors = authors;
@@ -368,29 +334,6 @@ impl MetadataReader {
             }
             "authors" | "author" => {
                 metadata.authors.extend(split_authors(value));
-                return;
-            }
-            "targetmilestone" | "milestone" => {
-                if !self.is_empty_value(value) {
-                    metadata.target_milestone = Some(value.to_string());
-                }
-                return;
-            }
-            "issue" | "githubissue" | "confluencelink" => {
-                if !self.is_empty_value(value) {
-                    metadata.issue = Some(value.to_string());
-                    metadata.links.push(Link {
-                        label: "Issue".to_string(),
-                        href: value.to_string(),
-                    });
-                }
-                return;
-            }
-            "initialrelease" => {
-                if !self.is_empty_value(value) {
-                    metadata.initial_release = Some(value.to_string());
-                    self.apply_extra_value_from_str(metadata, &canonical, value);
-                }
                 return;
             }
             _ => {}
@@ -948,20 +891,7 @@ fn parse_typed_str_value(value: &str, kind: MetadataValueType) -> Option<Metadat
 fn is_standard_key(key: &str) -> bool {
     matches!(
         canonicalize_key(key).as_str(),
-        "title"
-            | "status"
-            | "created"
-            | "updated"
-            | "lastupdated"
-            | "authors"
-            | "author"
-            | "links"
-            | "issue"
-            | "githubissue"
-            | "confluencelink"
-            | "initialrelease"
-            | "targetmilestone"
-            | "milestone"
+        "title" | "status" | "created" | "updated" | "lastupdated" | "authors" | "author" | "links"
     )
 }
 
