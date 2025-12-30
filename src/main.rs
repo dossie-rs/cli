@@ -4,6 +4,7 @@ use std::env;
 use std::fmt::Write;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod metadata;
 
@@ -109,6 +110,7 @@ struct PendingSpec {
     meta_created: Option<i64>,
     meta_updated: Option<i64>,
     git_paths: Vec<PathBuf>,
+    doc_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -768,6 +770,7 @@ fn load_specs_from_directory(
             meta_created: meta.created.as_deref().and_then(parse_date),
             meta_updated: meta.updated.as_deref().and_then(parse_date),
             git_paths: git_paths.unwrap_or_default(),
+            doc_path: doc_path.clone(),
         });
 
         static_mounts.push((format!("/{}", spec_id), static_root));
@@ -797,9 +800,19 @@ fn load_specs_from_directory(
             })
             .unwrap_or((None, None));
 
-        let created = pending.meta_created.or(git_addition);
+        let (file_created, file_modified) = file_timestamps(&pending.doc_path);
 
-        let updated = pending.meta_updated.or(git_change).or(created);
+        let created = pending
+            .meta_created
+            .or(git_addition)
+            .or(file_created)
+            .or(file_modified);
+
+        let updated = pending
+            .meta_updated
+            .or(git_change)
+            .or(file_modified)
+            .or(created);
 
         let updated_sort = updated
             .or(created)
@@ -1451,6 +1464,22 @@ fn normalize_asset_path(raw: &str) -> String {
         path = path.trim_start_matches("../").to_string();
     }
     path
+}
+
+fn file_timestamps(path: &Path) -> (Option<i64>, Option<i64>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (None, None);
+    };
+
+    let created = metadata.created().ok().and_then(system_time_to_millis);
+    let modified = metadata.modified().ok().and_then(system_time_to_millis);
+
+    (created.or(modified), modified)
+}
+
+fn system_time_to_millis(time: SystemTime) -> Option<i64> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().try_into().unwrap_or(i64::MAX))
 }
 
 fn copy_doc_assets(
@@ -2925,6 +2954,45 @@ mod tests {
 
         assert_ne!(first_title, second_title);
         assert_eq!(second_title, "Second Title");
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn uses_stat_times_for_untracked_documents() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "dossiers-stat-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_millis()
+        ));
+
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("create temp root");
+
+        let doc_path = temp_root.join("0002-stat.md");
+        fs::write(&doc_path, "# Stat Title\n\nBody").expect("write document");
+
+        let state = ReloadableAppState {
+            input_path: temp_root.clone(),
+            project_root: temp_root.clone(),
+            config_path: None,
+            assets: Assets::embedded(),
+        };
+
+        let loaded = state.load().expect("load should succeed");
+        let spec = loaded
+            .specs_by_id
+            .get("0002")
+            .expect("spec should be parsed");
+
+        let created = spec.created.expect("created should come from stat");
+        let updated = spec.updated.expect("updated should come from stat");
+        assert!(
+            updated >= created,
+            "updated should be at least created, got created={created}, updated={updated}"
+        );
 
         let _ = fs::remove_dir_all(&temp_root);
     }
