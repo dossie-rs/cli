@@ -28,17 +28,23 @@ pub struct MetadataReadResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct ProjectConfiguration {
+    #[allow(dead_code)]
     pub name: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
+    #[allow(dead_code)]
     pub repository: Option<String>,
     pub subdirectory: Option<String>,
     pub prefix: Option<String>,
+    #[allow(dead_code)]
     pub public_access: Option<bool>,
+    #[allow(dead_code)]
     pub allowed_github_organizations: Vec<String>,
+    #[allow(dead_code)]
     pub allowed_google_workspace_domains: Vec<String>,
     pub statuses: Vec<String>,
     pub default_status: Option<String>,
+    #[allow(dead_code)]
     pub new_status: Option<String>,
     pub extra_metadata_fields: Vec<ExtraMetadataField>,
     #[allow(dead_code)]
