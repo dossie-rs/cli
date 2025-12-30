@@ -20,9 +20,7 @@ pub fn open_git_repository(path: &Path) -> Option<GitRepository> {
         .workdir()
         .or_else(|| repo.path().parent())
         .map(|p| p.to_path_buf())?;
-    let workdir = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.clone());
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
 
     Some(GitRepository { repo, workdir })
 }
@@ -74,8 +72,10 @@ struct UpdateFlags {
 
 fn build_cache(repo: &GitRepository, paths: &[PathBuf]) -> GitTimestampCache {
     let rel_paths = normalize_paths(&repo.workdir, paths);
-    let mut times: HashMap<PathBuf, PathTimes> =
-        rel_paths.iter().map(|p| (p.clone(), PathTimes::default())).collect();
+    let mut times: HashMap<PathBuf, PathTimes> = rel_paths
+        .iter()
+        .map(|p| (p.clone(), PathTimes::default()))
+        .collect();
 
     if times.is_empty() {
         return GitTimestampCache { times };

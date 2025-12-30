@@ -298,6 +298,33 @@ struct LoadResult {
     static_mounts: Vec<StaticMount>,
 }
 
+#[derive(Clone)]
+struct ReloadableAppState {
+    input_path: PathBuf,
+    project_root: PathBuf,
+    config_path: Option<PathBuf>,
+    assets: Assets,
+}
+
+impl ReloadableAppState {
+    fn load(&self) -> Result<AppState> {
+        let project_config =
+            load_project_configuration(&self.project_root, self.config_path.as_deref());
+        let site_name = resolve_site_name(&self.project_root, &project_config);
+        build_app_state(
+            &self.input_path,
+            site_name,
+            self.assets.clone(),
+            project_config,
+        )
+        .map(|(state, _)| state)
+    }
+
+    fn assets(&self) -> &Assets {
+        &self.assets
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ParsedMetadata {
@@ -770,14 +797,9 @@ fn load_specs_from_directory(
             })
             .unwrap_or((None, None));
 
-        let created = pending
-            .meta_created
-            .or(git_addition);
+        let created = pending.meta_created.or(git_addition);
 
-        let updated = pending
-            .meta_updated
-            .or(git_change)
-            .or(created);
+        let updated = pending.meta_updated.or(git_change).or(created);
 
         let updated_sort = updated
             .or(created)
@@ -1210,12 +1232,19 @@ async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result
     let assets = Assets::from_assets_dir(project_root.join("assets"));
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state, static_mounts) = build_app_state(&input_path, site_name, assets, project_config)?;
+    let (_initial_state, static_mounts) =
+        build_app_state(&input_path, site_name, assets.clone(), project_config)?;
+    let reloadable_state = ReloadableAppState {
+        input_path: input_path.clone(),
+        project_root: project_root.clone(),
+        config_path: config_path.clone(),
+        assets,
+    };
 
     println!("Serving specs on http://localhost:8080");
     HttpServer::new(move || {
         let mut app = App::new()
-            .app_data(state.clone())
+            .app_data(web::Data::new(reloadable_state.clone()))
             .route("/", web::get().to(index_page))
             .route("/favicon.svg", web::get().to(favicon))
             .route("/author/{slug}/", web::get().to(author_redirect))
@@ -1265,9 +1294,7 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     let assets = Assets::embedded();
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state_data, static_mounts) =
-        build_app_state(&input_path, site_name, assets, project_config)?;
-    let state = state_data.get_ref();
+    let (state, static_mounts) = build_app_state(&input_path, site_name, assets, project_config)?;
 
     if output_dir.exists() {
         fs::remove_dir_all(&output_dir)
@@ -1279,13 +1306,13 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     let mount_map: HashMap<String, PathBuf> = static_mounts.into_iter().collect();
 
     let index_path = output_dir.join("index.html");
-    let index_html = render_index(state, "./").into_string();
+    let index_html = render_index(&state, "./").into_string();
     write_html_file(&index_path, index_html)?;
     write_embedded_favicon(&output_dir)?;
 
     for spec in &state.specs {
-        let rendered_html = render_spec_body(state, spec, "".to_string(), "../")?;
-        let page = render_spec(state, spec, &rendered_html, "../").into_string();
+        let rendered_html = render_spec_body(&state, spec, "".to_string(), "../")?;
+        let page = render_spec(&state, spec, &rendered_html, "../").into_string();
         let dest = output_dir.join(&spec.id).join("index.html");
         write_html_file(&dest, page)?;
 
@@ -1305,13 +1332,13 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
             .iter()
             .filter(|spec| spec.authors.iter().any(|a| slugify_author(a) == slug))
             .collect();
-        let page = render_author(state, &name, &authored, "../../").into_string();
+        let page = render_author(&state, &name, &authored, "../../").into_string();
         let dest = output_dir.join("author").join(slug).join("index.html");
         write_html_file(&dest, page)?;
     }
 
     if !index_path.exists() {
-        write_html_file(&index_path, render_index(state, "./").into_string())?;
+        write_html_file(&index_path, render_index(&state, "./").into_string())?;
     }
 
     println!(
@@ -1327,7 +1354,7 @@ fn build_app_state(
     site_name: String,
     assets: Assets,
     project_config: ProjectConfiguration,
-) -> Result<(web::Data<AppState>, Vec<StaticMount>)> {
+) -> Result<(AppState, Vec<StaticMount>)> {
     let (specs, static_mounts) = load_and_sort_specs(input_path, &project_config)?;
     let spec_ids = specs.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
     let renderer = DocRenderer::new();
@@ -1337,7 +1364,7 @@ fn build_app_state(
         .map(|spec| (spec.id.clone(), spec))
         .collect::<HashMap<_, _>>();
 
-    let state = web::Data::new(AppState {
+    let state = AppState {
         specs,
         specs_by_id,
         spec_ids,
@@ -1347,7 +1374,7 @@ fn build_app_state(
         extra_fields: project_config.extra_metadata_fields.clone(),
         assets,
         renderer,
-    });
+    };
 
     Ok((state, static_mounts))
 }
@@ -1484,18 +1511,27 @@ fn write_html_file(path: &Path, content: String) -> Result<()> {
     fs::write(path, content).with_context(|| format!("Writing {}", path.display()))
 }
 
-async fn favicon(state: web::Data<AppState>) -> impl Responder {
-    let favicon = state.assets.favicon();
+async fn favicon(state: web::Data<ReloadableAppState>) -> impl Responder {
+    let favicon = state.assets().favicon();
     HttpResponse::Ok()
         .content_type("image/svg+xml")
         .body(favicon)
 }
 
-async fn index_page(state: web::Data<AppState>) -> impl Responder {
-    let markup = render_index(&state, "/");
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(markup.into_string())
+async fn index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
+    match state.load() {
+        Ok(loaded) => {
+            let markup = render_index(&loaded, "/");
+            HttpResponse::Ok()
+                .content_type("text/html; charset=utf-8")
+                .body(markup.into_string())
+        }
+        Err(err) => {
+            eprintln!("Failed to load specs for index: {err:?}");
+            HttpResponse::InternalServerError()
+                .body(format!("Failed to load specifications: {err}"))
+        }
+    }
 }
 
 async fn spec_redirect(path: web::Path<String>) -> impl Responder {
@@ -1505,15 +1541,27 @@ async fn spec_redirect(path: web::Path<String>) -> impl Responder {
         .finish()
 }
 
-async fn spec_page(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
+async fn spec_page(
+    path: web::Path<String>,
+    state: web::Data<ReloadableAppState>,
+) -> impl Responder {
     let spec_id = path.into_inner();
-    let Some(spec) = state.specs_by_id.get(&spec_id) else {
+    let loaded = match state.load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("Failed to load specs for {spec_id}: {err:?}");
+            return HttpResponse::InternalServerError()
+                .body(format!("Failed to load specification {spec_id}: {err}"));
+        }
+    };
+
+    let Some(spec) = loaded.specs_by_id.get(&spec_id) else {
         return HttpResponse::Found()
             .append_header(("Location", "/"))
             .finish();
     };
 
-    let rendered_html = match render_spec_body(&state, spec, format!("/{}/", spec.id), "/") {
+    let rendered_html = match render_spec_body(&loaded, spec, format!("/{}/", spec.id), "/") {
         Ok(html) => html,
         Err(err) => {
             eprintln!("Failed to render spec {spec_id}: {err:?}");
@@ -1522,7 +1570,7 @@ async fn spec_page(path: web::Path<String>, state: web::Data<AppState>) -> impl 
         }
     };
 
-    let markup = render_spec(&state, spec, &rendered_html, "/");
+    let markup = render_spec(&loaded, spec, &rendered_html, "/");
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
@@ -1535,9 +1583,20 @@ async fn author_redirect(path: web::Path<String>) -> impl Responder {
         .finish()
 }
 
-async fn author_page(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
+async fn author_page(
+    path: web::Path<String>,
+    state: web::Data<ReloadableAppState>,
+) -> impl Responder {
     let slug = path.into_inner();
-    let authored: Vec<&SpecDocument> = state
+    let loaded = match state.load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("Failed to load specs for author page: {err:?}");
+            return HttpResponse::InternalServerError()
+                .body(format!("Failed to load author page: {err}"));
+        }
+    };
+    let authored: Vec<&SpecDocument> = loaded
         .specs
         .iter()
         .filter(|spec| {
@@ -1554,7 +1613,7 @@ async fn author_page(path: web::Path<String>, state: web::Data<AppState>) -> imp
         .cloned()
         .unwrap_or_else(|| slug.clone());
 
-    let markup = render_author(&state, &author_name, &authored, "/");
+    let markup = render_author(&loaded, &author_name, &authored, "/");
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
@@ -2802,6 +2861,8 @@ fn parse_toml_config(raw: &str, path: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn renders_basic_asciidoc() {
@@ -2819,5 +2880,52 @@ mod tests {
             html.contains("<h1"),
             "doctype title should be present, got: {html}"
         );
+    }
+
+    #[test]
+    fn reloadable_state_reloads_documents_on_each_call() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "dossiers-reload-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_millis()
+        ));
+
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("create temp root");
+
+        let doc_path = temp_root.join("0001-demo.md");
+        fs::write(&doc_path, "# First Title\n\nBody").expect("write initial document");
+
+        let state = ReloadableAppState {
+            input_path: temp_root.clone(),
+            project_root: temp_root.clone(),
+            config_path: None,
+            assets: Assets::embedded(),
+        };
+
+        let first = state.load().expect("initial load should succeed");
+        let first_title = first
+            .specs_by_id
+            .get("0001")
+            .expect("spec exists after first load")
+            .title
+            .clone();
+
+        fs::write(&doc_path, "# Second Title\n\nBody").expect("write updated document");
+
+        let second = state.load().expect("reload should succeed");
+        let second_title = second
+            .specs_by_id
+            .get("0001")
+            .expect("spec exists after reload")
+            .title
+            .clone();
+
+        assert_ne!(first_title, second_title);
+        assert_eq!(second_title, "Second Title");
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }
