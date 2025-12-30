@@ -795,13 +795,6 @@ fn markdown_plain_text(raw: &str) -> String {
         .join(" ")
 }
 
-fn default_alias_map() -> HashMap<String, String> {
-    HashMap::from([
-        ("featurename".to_string(), "title".to_string()),
-        ("startdate".to_string(), "created".to_string()),
-    ])
-}
-
 fn parse_authors_from_yaml(value: &YamlValue) -> Option<Vec<String>> {
     match value {
         YamlValue::String(text) => Some(split_authors(text)),
