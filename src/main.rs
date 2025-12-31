@@ -1480,7 +1480,7 @@ fn augment_with_pull_requests(
             files.len()
         );
 
-        let Some((spec_id, spec_relative_dir, used_pr_id, primary_relative)) = map_pull_to_spec(
+        let Some(targets) = map_pull_to_specs(
             &files,
             &spec_root_relative,
             pull.number,
@@ -1498,48 +1498,56 @@ fn augment_with_pull_requests(
             continue;
         };
         eprintln!(
-            "PR #{} maps to spec {} under {}",
+            "PR #{} maps to {} spec target(s).",
             pull.number,
-            spec_id,
-            spec_relative_dir.display()
+            targets.len()
         );
-        if used_pr_id {
-            eprintln!(
-                "PR #{} is mapped as a new draft spec using PR number {}.",
-                pull.number, spec_id
-            );
-        }
 
-        if let Err(err) = build_pr_spec_version(
-            state,
-            static_mounts,
-            &client,
-            &metadata_reader,
-            &pull,
-            &files,
-            &spec_id,
-            &spec_relative_dir,
-            &spec_root,
-            &spec_root_relative,
-            project_root,
-            &primary_relative,
-        ) {
+        for target in targets {
             eprintln!(
-                "Warning: failed to build PR #{} preview for {}: {err}",
-                pull.number, spec_id
+                "PR #{} -> spec {} at {}",
+                pull.number,
+                target.spec_id,
+                target.primary_relative.display()
             );
-        } else {
-            let base_spec_exists = state.specs_by_id.contains_key(&spec_id);
-            if base_spec_exists {
+            if target.used_pr_id {
                 eprintln!(
-                    "Added PR #{} as revision for existing spec {}.",
-                    pull.number, spec_id
+                    "PR #{} is mapped as a new draft spec using PR number {}.",
+                    pull.number, target.spec_id
+                );
+            }
+
+            if let Err(err) = build_pr_spec_version(
+                state,
+                static_mounts,
+                &client,
+                &metadata_reader,
+                &pull,
+                &files,
+                &target.spec_id,
+                &target.spec_relative_dir,
+                &spec_root,
+                &spec_root_relative,
+                project_root,
+                &target.primary_relative,
+            ) {
+                eprintln!(
+                    "Warning: failed to build PR #{} preview for {}: {err}",
+                    pull.number, target.spec_id
                 );
             } else {
-                eprintln!(
-                    "Added PR #{} as new spec {} (listed in index).",
-                    pull.number, spec_id
-                );
+                let base_spec_exists = state.specs_by_id.contains_key(&target.spec_id);
+                if base_spec_exists {
+                    eprintln!(
+                        "Added PR #{} as revision for existing spec {}.",
+                        pull.number, target.spec_id
+                    );
+                } else {
+                    eprintln!(
+                        "Added PR #{} as new spec {} (listed in index).",
+                        pull.number, target.spec_id
+                    );
+                }
             }
         }
     }
@@ -1551,17 +1559,24 @@ fn augment_with_pull_requests(
     Ok(())
 }
 
-fn map_pull_to_spec(
+struct SpecTarget {
+    spec_id: String,
+    spec_relative_dir: PathBuf,
+    primary_relative: PathBuf,
+    used_pr_id: bool,
+}
+
+fn map_pull_to_specs(
     files: &[GithubFile],
     spec_root_relative: &Path,
     pr_number: u64,
     pr_number_as_spec_id: bool,
-) -> Option<(String, PathBuf, bool, PathBuf)> {
-    let mut spec_id: Option<String> = None;
-    let mut spec_dir: Option<PathBuf> = None;
+) -> Option<Vec<SpecTarget>> {
     let mut ignored_non_spec = 0usize;
     let pr_id = pr_number.to_string();
     let mut primary_relative: Option<PathBuf> = None;
+    let mut targets: Vec<SpecTarget> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
     for file in files {
         let repo_path = Path::new(&file.filename);
@@ -1571,43 +1586,31 @@ fn map_pull_to_spec(
             ignored_non_spec += 1;
             continue;
         };
+        let target_id = if pr_number_as_spec_id && (current_id == "0000" || current_id == pr_id) {
+            pr_id.clone()
+        } else {
+            current_id.clone()
+        };
+
+        let target_dir = spec_dir_for_relative_path(&relative_path, &current_id)
+            .unwrap_or_else(|| PathBuf::new());
+        let primary = relative_path.clone();
+
+        if seen_ids.insert(target_id.clone()) {
+            targets.push(SpecTarget {
+                spec_id: target_id,
+                spec_relative_dir: target_dir,
+                primary_relative: primary,
+                used_pr_id: pr_number_as_spec_id && (current_id == "0000" || current_id == pr_id),
+            });
+        }
 
         if primary_relative.is_none() {
-            primary_relative = Some(relative_path.clone());
-        }
-
-        if let Some(existing) = spec_id.as_ref() {
-            if existing != &current_id {
-                eprintln!(
-                    "Skipping PR mapping: multiple spec ids detected ({existing} and {current_id})."
-                );
-                return None;
-            }
-        } else {
-            spec_id = Some(current_id.clone());
-        }
-
-        if spec_dir.is_none() {
-            spec_dir = spec_dir_for_relative_path(&relative_path, &current_id);
-        }
-
-        if let Some(previous) = file.previous_filename.as_ref() {
-            let previous_path = Path::new(previous);
-            if let Some((previous_id, _)) =
-                spec_id_from_repo_path(previous_path, spec_root_relative)
-            {
-                if Some(previous_id) != spec_id {
-                    eprintln!(
-                        "Skipping PR mapping: previous filename {} points to different spec.",
-                        previous
-                    );
-                    return None;
-                }
-            }
+            primary_relative = Some(relative_path);
         }
     }
 
-    if spec_id.is_none() {
+    if targets.is_empty() {
         eprintln!(
             "Skipping PR mapping: no spec files under {} were touched (ignored {} non-spec file(s)).",
             spec_root_relative.display(),
@@ -1616,20 +1619,7 @@ fn map_pull_to_spec(
         return None;
     }
 
-    let detected_id = spec_id.unwrap();
-    let mapped_id = if pr_number_as_spec_id && (detected_id == "0000" || detected_id == pr_id) {
-        pr_id
-    } else {
-        detected_id.clone()
-    };
-
-    let dir = spec_dir.unwrap_or_else(PathBuf::new);
-    Some((
-        mapped_id.clone(),
-        dir,
-        mapped_id != detected_id,
-        primary_relative.unwrap(),
-    ))
+    Some(targets)
 }
 
 fn build_pr_spec_version(
@@ -1766,10 +1756,12 @@ fn build_pr_spec_version(
     let (file_created, file_modified) = file_timestamps(&doc_path);
 
     let created = meta_created
+        .or(Some(pull.created_at))
         .or_else(|| base_spec.and_then(|spec| spec.created))
         .or(file_created)
         .or(file_modified);
     let updated = meta_updated
+        .or(Some(pull.updated_at))
         .or_else(|| base_spec.and_then(|spec| spec.updated))
         .or(file_modified)
         .or(created)

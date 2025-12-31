@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -14,6 +15,8 @@ pub struct GithubPull {
     pub number: u64,
     pub draft: bool,
     pub head_sha: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +81,8 @@ impl GithubClient {
                 number: pull.number,
                 draft: pull.draft,
                 head_sha: pull.head.sha,
+                created_at: parse_timestamp(&pull.created_at),
+                updated_at: parse_timestamp(&pull.updated_at),
             }));
 
             if count < 50 {
@@ -220,6 +225,8 @@ struct PullResponse {
     number: u64,
     draft: bool,
     head: HeadRef,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,4 +245,10 @@ struct FileResponse {
 #[derive(Debug, Deserialize)]
 struct ContentResponse {
     download_url: Option<String>,
+}
+
+fn parse_timestamp(raw: &str) -> i64 {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|_| Utc::now().timestamp_millis())
 }
