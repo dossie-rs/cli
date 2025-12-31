@@ -17,6 +17,7 @@ pub struct GithubPull {
     pub head_sha: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub author: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +84,7 @@ impl GithubClient {
                 head_sha: pull.head.sha,
                 created_at: parse_timestamp(&pull.created_at),
                 updated_at: parse_timestamp(&pull.updated_at),
+                author: pull.user.map(|u| u.login),
             }));
 
             if count < 50 {
@@ -227,6 +229,8 @@ struct PullResponse {
     head: HeadRef,
     created_at: String,
     updated_at: String,
+    #[serde(default)]
+    user: Option<UserRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +249,11 @@ struct FileResponse {
 #[derive(Debug, Deserialize)]
 struct ContentResponse {
     download_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserRef {
+    login: String,
 }
 
 fn parse_timestamp(raw: &str) -> i64 {

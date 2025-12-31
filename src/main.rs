@@ -1752,6 +1752,14 @@ fn build_pr_spec_version(
 
     let meta_created = meta.created.as_deref().and_then(parse_date);
     let meta_updated = meta.updated.as_deref().and_then(parse_date);
+    let authors = if meta.authors.is_empty() {
+        pull.author
+            .as_ref()
+            .map(|a| vec![a.clone()])
+            .unwrap_or_default()
+    } else {
+        meta.authors.clone()
+    };
     let base_created = state.specs_by_id.get(spec_id).and_then(|spec| spec.created);
     let base_updated = state.specs_by_id.get(spec_id).and_then(|spec| spec.updated);
     let base_exists = state.specs_by_id.contains_key(spec_id);
@@ -1787,7 +1795,7 @@ fn build_pr_spec_version(
         status,
         created,
         updated: Some(updated),
-        authors: meta.authors,
+        authors,
         links: meta.links,
         updated_sort,
         extra: metadata_extra_to_json(&meta.extra),
