@@ -1573,7 +1573,7 @@ fn map_pull_to_specs(
     pr_number_as_spec_id: bool,
 ) -> Option<Vec<SpecTarget>> {
     let mut ignored_non_spec = 0usize;
-    let pr_id = pr_number.to_string();
+    let pr_id = format!("{pr_number:04}");
     let mut primary_relative: Option<PathBuf> = None;
     let mut targets: Vec<SpecTarget> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
