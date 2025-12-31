@@ -1480,8 +1480,12 @@ fn augment_with_pull_requests(
             files.len()
         );
 
-        let Some((spec_id, spec_relative_dir)) = map_pull_to_spec(&files, &spec_root_relative)
-        else {
+        let Some((spec_id, spec_relative_dir, used_pr_id, primary_relative)) = map_pull_to_spec(
+            &files,
+            &spec_root_relative,
+            pull.number,
+            project_config.pr_number_as_spec_id,
+        ) else {
             eprintln!(
                 "Skipping PR #{}: no eligible spec changes. Files: {}",
                 pull.number,
@@ -1499,6 +1503,12 @@ fn augment_with_pull_requests(
             spec_id,
             spec_relative_dir.display()
         );
+        if used_pr_id {
+            eprintln!(
+                "PR #{} is mapped as a new draft spec using PR number {}.",
+                pull.number, spec_id
+            );
+        }
 
         if let Err(err) = build_pr_spec_version(
             state,
@@ -1512,6 +1522,7 @@ fn augment_with_pull_requests(
             &spec_root,
             &spec_root_relative,
             project_root,
+            &primary_relative,
         ) {
             eprintln!(
                 "Warning: failed to build PR #{} preview for {}: {err}",
@@ -1540,10 +1551,17 @@ fn augment_with_pull_requests(
     Ok(())
 }
 
-fn map_pull_to_spec(files: &[GithubFile], spec_root_relative: &Path) -> Option<(String, PathBuf)> {
+fn map_pull_to_spec(
+    files: &[GithubFile],
+    spec_root_relative: &Path,
+    pr_number: u64,
+    pr_number_as_spec_id: bool,
+) -> Option<(String, PathBuf, bool, PathBuf)> {
     let mut spec_id: Option<String> = None;
     let mut spec_dir: Option<PathBuf> = None;
     let mut ignored_non_spec = 0usize;
+    let pr_id = pr_number.to_string();
+    let mut primary_relative: Option<PathBuf> = None;
 
     for file in files {
         let repo_path = Path::new(&file.filename);
@@ -1553,6 +1571,10 @@ fn map_pull_to_spec(files: &[GithubFile], spec_root_relative: &Path) -> Option<(
             ignored_non_spec += 1;
             continue;
         };
+
+        if primary_relative.is_none() {
+            primary_relative = Some(relative_path.clone());
+        }
 
         if let Some(existing) = spec_id.as_ref() {
             if existing != &current_id {
@@ -1594,8 +1616,20 @@ fn map_pull_to_spec(files: &[GithubFile], spec_root_relative: &Path) -> Option<(
         return None;
     }
 
+    let detected_id = spec_id.unwrap();
+    let mapped_id = if pr_number_as_spec_id && (detected_id == "0000" || detected_id == pr_id) {
+        pr_id
+    } else {
+        detected_id.clone()
+    };
+
     let dir = spec_dir.unwrap_or_else(PathBuf::new);
-    Some((spec_id.unwrap(), dir))
+    Some((
+        mapped_id.clone(),
+        dir,
+        mapped_id != detected_id,
+        primary_relative.unwrap(),
+    ))
 }
 
 fn build_pr_spec_version(
@@ -1610,6 +1644,7 @@ fn build_pr_spec_version(
     spec_root: &Path,
     spec_root_relative: &Path,
     project_root: &Path,
+    primary_relative: &Path,
 ) -> Result<()> {
     let workspace_root = project_root
         .join("target")
@@ -1619,20 +1654,23 @@ fn build_pr_spec_version(
         let _ = fs::remove_dir_all(&workspace_root);
     }
     let spec_root_temp = workspace_root.join("specs");
-    let spec_dir_temp = spec_root_temp.join(spec_relative_dir);
-    fs::create_dir_all(&spec_dir_temp)
-        .with_context(|| format!("creating workspace for PR #{}", pull.number))?;
+    let target_doc = spec_root_temp.join(primary_relative);
+    if let Some(parent) = target_doc.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace for PR #{}", pull.number))?;
+    } else {
+        fs::create_dir_all(&spec_root_temp)
+            .with_context(|| format!("creating workspace for PR #{}", pull.number))?;
+    }
 
-    let local_spec_dir = spec_root.join(spec_relative_dir);
-    if local_spec_dir.exists() {
-        if local_spec_dir.is_dir() {
-            copy_dir_contents(&local_spec_dir, &spec_dir_temp)?;
-        } else {
-            if let Some(parent) = spec_dir_temp.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&local_spec_dir, &spec_dir_temp)
-                .with_context(|| format!("copying baseline {}", local_spec_dir.display()))?;
+    let local_doc = spec_root.join(primary_relative);
+    if local_doc.exists() && local_doc.is_file() {
+        fs::copy(&local_doc, &target_doc)
+            .with_context(|| format!("copying baseline document {}", local_doc.display()))?;
+    } else if !spec_relative_dir.as_os_str().is_empty() {
+        let local_spec_dir = spec_root.join(spec_relative_dir);
+        if local_spec_dir.exists() && local_spec_dir.is_dir() {
+            copy_dir_contents(&local_spec_dir, &spec_root_temp.join(spec_relative_dir))?;
         }
     }
 
@@ -1679,7 +1717,7 @@ fn build_pr_spec_version(
             .with_context(|| format!("writing PR file {}", target_path.display()))?;
     }
 
-    let doc_root = spec_root_temp.join(spec_relative_dir);
+    let doc_root = spec_root_temp.join(primary_relative);
     let (doc_path, format) = if doc_root.is_dir() {
         find_doc_file(&doc_root)?
     } else if doc_root.is_file() {
@@ -1817,9 +1855,7 @@ fn spec_dir_for_relative_path(path: &Path, spec_id: &str) -> Option<PathBuf> {
         let name = os.to_str()?;
         if let Some(id) = extract_spec_id(name) {
             if id == spec_id {
-                if components.peek().is_some() {
-                    accum.push(name);
-                }
+                accum.push(name);
                 return Some(accum);
             }
         }
