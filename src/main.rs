@@ -1752,24 +1752,26 @@ fn build_pr_spec_version(
 
     let meta_created = meta.created.as_deref().and_then(parse_date);
     let meta_updated = meta.updated.as_deref().and_then(parse_date);
-    let base_spec = state.specs_by_id.get(spec_id);
+    let base_created = state.specs_by_id.get(spec_id).and_then(|spec| spec.created);
+    let base_updated = state.specs_by_id.get(spec_id).and_then(|spec| spec.updated);
+    let base_exists = state.specs_by_id.contains_key(spec_id);
     let (file_created, file_modified) = file_timestamps(&doc_path);
 
     let created = meta_created
         .or(Some(pull.created_at))
-        .or_else(|| base_spec.and_then(|spec| spec.created))
+        .or(base_created)
         .or(file_created)
         .or(file_modified);
     let updated = meta_updated
         .or(Some(pull.updated_at))
-        .or_else(|| base_spec.and_then(|spec| spec.updated))
+        .or(base_updated)
         .or(file_modified)
         .or(created)
         .unwrap_or_else(|| Utc::now().timestamp_millis());
     let updated_sort = updated;
 
     let status = meta.status.unwrap_or(status_fallback);
-    let pr_id = if base_spec.is_some() {
+    let pr_id = if base_exists {
         format!("{}/pr/{}", spec_id, pull.number)
     } else {
         spec_id.to_string()
@@ -1791,12 +1793,12 @@ fn build_pr_spec_version(
         extra: metadata_extra_to_json(&meta.extra),
         source: parsed.body,
         format,
-        listed: base_spec.is_none(),
-        revision_of: base_spec.map(|_| spec_id.to_string()),
+        listed: !base_exists,
+        revision_of: base_exists.then(|| spec_id.to_string()),
         pr_number: Some(pull.number),
     };
 
-    let mount_path = if base_spec.is_some() {
+    let mount_path = if base_exists {
         format!("/{}/pr/{}", spec_id, pull.number)
     } else {
         format!("/{spec_id}")
@@ -1809,15 +1811,17 @@ fn build_pr_spec_version(
     static_mounts.push((mount_path, static_root));
     insert_spec_document(state, pr_spec.clone());
 
-    state
-        .revisions
-        .entry(spec_id.to_string())
-        .or_default()
-        .push(RevisionLink {
-            pr_number: pull.number,
-            status: pr_spec.status.clone(),
-            href: pr_spec.id.clone(),
-        });
+    if base_exists {
+        state
+            .revisions
+            .entry(spec_id.to_string())
+            .or_default()
+            .push(RevisionLink {
+                pr_number: pull.number,
+                status: pr_spec.status.clone(),
+                href: pr_spec.id.clone(),
+            });
+    }
 
     Ok(())
 }
