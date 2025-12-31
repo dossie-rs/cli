@@ -3143,7 +3143,13 @@ fn display_name_from_dir(dir_name: &str) -> String {
         static ref NAME_PREFIX_RE: Regex = Regex::new(r"^\d{4,}-").unwrap();
     }
 
-    let cleaned = NAME_PREFIX_RE.replace(dir_name, "").to_string();
+    let cleaned = NAME_PREFIX_RE
+        .replace(dir_name, "")
+        .trim_end_matches(".md")
+        .trim_end_matches(".markdown")
+        .trim_end_matches(".adoc")
+        .trim_end_matches(".asciidoc")
+        .to_string();
     if cleaned.is_empty() {
         dir_name.to_string()
     } else {
