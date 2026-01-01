@@ -36,6 +36,7 @@ pub struct ProjectConfiguration {
     pub repository: Option<String>,
     pub subdirectory: Option<String>,
     pub prefix: Option<String>,
+    pub pr_number_as_spec_id: bool,
     #[allow(dead_code)]
     pub public_access: Option<bool>,
     #[allow(dead_code)]
@@ -557,6 +558,12 @@ impl ProjectConfiguration {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let pr_number_as_spec_id = value
+            .get("prNumberAsSpecId")
+            .or_else(|| value.get("pr_number_as_spec_id"))
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+
         let public_access = value
             .get("public_access")
             .or_else(|| value.get("publicAccess"))
@@ -661,6 +668,7 @@ impl ProjectConfiguration {
             repository,
             subdirectory,
             prefix,
+            pr_number_as_spec_id,
             public_access,
             allowed_github_organizations,
             allowed_google_workspace_domains,

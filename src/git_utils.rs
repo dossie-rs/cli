@@ -12,6 +12,21 @@ impl GitRepository {
     pub fn workdir(&self) -> &Path {
         &self.workdir
     }
+
+    pub fn remote_url(&self) -> Option<String> {
+        let remotes = self.repo.remotes().ok()?;
+        for name in remotes.iter().flatten() {
+            if let Ok(remote) = self.repo.find_remote(name) {
+                if let Some(url) = remote.url() {
+                    if !url.is_empty() {
+                        return Some(url.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 pub fn open_git_repository(path: &Path) -> Option<GitRepository> {
