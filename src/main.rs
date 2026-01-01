@@ -3771,7 +3771,7 @@ fn extract_heading_ids(renderer: &DocRenderer, source: &str, format: DocFormat) 
             .get(4)
             .and_then(|m| m.as_str().parse().ok())
             .unwrap_or(level);
-        if level != closing_level || level < 2 || level > 4 {
+        if level != closing_level || !(2..=4).contains(&level) {
             continue;
         }
 
