@@ -1027,6 +1027,7 @@ enum CliCommand {
         output_dir: PathBuf,
     },
     Check(PathBuf),
+    List(PathBuf),
 }
 
 #[actix_web::main]
@@ -1067,6 +1068,7 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             Ok(())
         }
         CliCommand::Check(input_path) => run_check(input_path, config_path),
+        CliCommand::List(input_path) => run_list(input_path, config_path),
     }
 }
 
@@ -1259,6 +1261,16 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
                 output_dir: output,
             })
         }
+        "list" => {
+            let path = args
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing path for list"))?;
+            if args.next().is_some() {
+                bail!("Unexpected argument for list");
+            }
+            Ok(CliCommand::List(validate_path(path)?))
+        }
         "check" => {
             let path = args
                 .next()
@@ -1282,6 +1294,7 @@ fn print_usage() {
         "  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>"
     );
     eprintln!("  dossiers [-c <config-file>] build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
+    eprintln!("  dossiers [-c <config-file>] list <path-to-spec-directory|path-to-spec-data.json>");
     eprintln!("  dossiers [-c <config-file>] check <path-to-spec-directory>");
 }
 
@@ -1369,6 +1382,65 @@ fn run_check(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_list(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+    let resolved_input = resolve_spec_input_path(&input_path, &project_config);
+    let mut load_result = load_specs(&resolved_input, &project_config)?;
+    load_result
+        .specs
+        .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.title.cmp(&b.title)));
+
+    let display_prefix = project_config.prefix.unwrap_or_default();
+    let use_color = supports_color();
+
+    if load_result.specs.is_empty() {
+        println!("No specifications found");
+        return Ok(());
+    }
+
+    for spec in load_result.specs {
+        print_list_entry(&spec, &display_prefix, use_color);
+        println!();
+    }
+
+    Ok(())
+}
+
+fn print_list_entry(spec: &SpecDocument, display_prefix: &str, use_color: bool) {
+    let bold_start = if use_color { "\u{001b}[1m" } else { "" };
+    let bold_end = if use_color { "\u{001b}[22m" } else { "" };
+    let bullet = if use_color {
+        "\u{001b}[90m•\u{001b}[0m"
+    } else {
+        "•"
+    };
+
+    let display_id = format!("{display_prefix}{}", spec.id);
+    println!("{bullet} {display_id} {bold_start}{}{bold_end}", spec.title);
+
+    let status = color_status(&spec.status, use_color);
+    let created = format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into());
+    let updated = format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into());
+    println!("  {status}, created: {created}, updated: {updated}");
+}
+
+fn color_status(status: &str, use_color: bool) -> String {
+    if !use_color {
+        return status.to_string();
+    }
+
+    let reset = "\u{001b}[0m";
+    let fg = match status.to_ascii_uppercase().as_str() {
+        "PUBLISHED" => "\u{001b}[32m",
+        "DRAFT" | "REVIEW" => "\u{001b}[33m",
+        "ABANDONED" => "\u{001b}[90m",
+        _ => "\u{001b}[36m",
+    };
+
+    format!("{fg}{status}{reset}")
 }
 
 fn print_category_report(report: &CategoryReport, success_message: &str) -> (usize, usize) {
