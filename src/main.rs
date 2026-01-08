@@ -289,6 +289,7 @@ struct AppState {
     site_name: String,
     site_description: String,
     extra_fields: Vec<ExtraMetadataField>,
+    generated_at: i64,
     assets: Assets,
     renderer: DocRenderer,
 }
@@ -1369,6 +1370,7 @@ fn build_app_state(
     project_config: ProjectConfiguration,
 ) -> Result<(AppState, Vec<StaticMount>)> {
     let (specs, static_mounts) = load_and_sort_specs(input_path, &project_config)?;
+    let generated_at = chrono::Utc::now().timestamp_millis();
     let spec_ids = specs.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
     let renderer = DocRenderer::new();
     let specs_by_id = specs
@@ -1385,6 +1387,7 @@ fn build_app_state(
         site_name,
         site_description: project_config.description.unwrap_or_default(),
         extra_fields: project_config.extra_metadata_fields.clone(),
+        generated_at,
         assets,
         renderer,
     };
@@ -1710,6 +1713,7 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -1842,6 +1846,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -1902,6 +1907,7 @@ fn render_author(
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -1937,6 +1943,16 @@ struct LayoutAssets<'a> {
     theme_toggle_js: &'a str,
 }
 
+fn format_generated_at(timestamp: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp)
+        .single()
+        .unwrap_or_else(Local::now)
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn base_layout(
     site_name: &str,
     site_description: &str,
@@ -1945,6 +1961,7 @@ fn base_layout(
     assets: LayoutAssets,
     content: Markup,
     prefix: &str,
+    generated_at: i64,
 ) -> Markup {
     let LayoutAssets {
         css,
@@ -1953,6 +1970,8 @@ fn base_layout(
     } = assets;
     let home_href = join_prefix(prefix, "");
     let favicon_href = join_prefix(prefix, "favicon.svg");
+    let version = env!("CARGO_PKG_VERSION");
+    let formatted_generated_at = format_generated_at(generated_at);
     html! {
         (PreEscaped("<!doctype html>"))
         html lang="en" {
@@ -1987,7 +2006,10 @@ fn base_layout(
                 (content)
                 footer class="site-footer" {
                     div class="container" {
-                        span { "Powered by Dossiers" }
+                        "Powered by "
+                        a href="https://dossie.rs" { "Dossiers" }
+                        " v" (version)
+                        span class="footer-label" { " • Built " (formatted_generated_at) }
                     }
                 }
                 script { (PreEscaped(theme_toggle_js)) }
