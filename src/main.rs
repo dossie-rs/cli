@@ -28,7 +28,7 @@ use maud::{html, Markup, PreEscaped};
 use metadata::{
     ExtraMetadataField, MetadataReader, MetadataValue, MetadataValueType, ProjectConfiguration,
 };
-use pulldown_cmark::{html as md_html, Options as MdOptions, Parser};
+use pulldown_cmark::{html as md_html, Options as MdOptions, Parser, Tag};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -115,6 +115,65 @@ struct PendingSpec {
     meta_updated: Option<i64>,
     git_paths: Vec<PathBuf>,
     doc_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct LintSpec {
+    id: String,
+    dir_name: String,
+    doc_path: PathBuf,
+    spec_root: PathBuf,
+    source: String,
+    format: DocFormat,
+}
+
+#[derive(Debug)]
+struct AssetReference {
+    path: String,
+    line: usize,
+}
+
+#[derive(Debug)]
+struct CrossReference {
+    raw: String,
+    target_spec: String,
+    anchor: Option<String>,
+    line: usize,
+}
+
+#[derive(Debug, Default)]
+struct SpecLintData {
+    anchors: Vec<String>,
+    assets: Vec<AssetReference>,
+    cross_refs: Vec<CrossReference>,
+}
+
+#[derive(Debug)]
+struct LintMessage {
+    message: String,
+    location: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CategoryReport {
+    errors: Vec<LintMessage>,
+    warnings: Vec<LintMessage>,
+}
+
+impl CategoryReport {
+    fn add_error(&mut self, message: impl Into<String>, location: Option<String>) {
+        self.errors.push(LintMessage {
+            message: message.into(),
+            location,
+        });
+    }
+
+    fn add_warning(&mut self, message: impl Into<String>, location: Option<String>) {
+        self.warnings.push(LintMessage {
+            message: message.into(),
+            location,
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -294,6 +353,7 @@ struct AppState {
     site_name: String,
     site_description: String,
     extra_fields: Vec<ExtraMetadataField>,
+    generated_at: i64,
     assets: Assets,
     renderer: DocRenderer,
 }
@@ -988,6 +1048,8 @@ enum CliCommand {
         input_path: PathBuf,
         output_dir: PathBuf,
     },
+    Check(PathBuf),
+    List(PathBuf),
 }
 
 #[actix_web::main]
@@ -1029,6 +1091,8 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
                 .map_err(|err| anyhow!("build task failed: {err}"))??;
             Ok(())
         }
+        CliCommand::Check(input_path) => run_check(input_path, config_path),
+        CliCommand::List(input_path) => run_list(input_path, config_path),
     }
 }
 
@@ -1221,6 +1285,26 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
                 output_dir: output,
             })
         }
+        "list" => {
+            let path = args
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing path for list"))?;
+            if args.next().is_some() {
+                bail!("Unexpected argument for list");
+            }
+            Ok(CliCommand::List(validate_path(path)?))
+        }
+        "check" => {
+            let path = args
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing path for check"))?;
+            if args.next().is_some() {
+                bail!("Unexpected argument for check");
+            }
+            Ok(CliCommand::Check(validate_path(path)?))
+        }
         _ => bail!("Unknown command: {command}"),
     }
 }
@@ -1234,6 +1318,8 @@ fn print_usage() {
         "  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>"
     );
     eprintln!("  dossiers [-c <config-file>] build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
+    eprintln!("  dossiers [-c <config-file>] list <path-to-spec-directory|path-to-spec-data.json>");
+    eprintln!("  dossiers [-c <config-file>] check <path-to-spec-directory>");
 }
 
 fn validate_path(path: String) -> Result<PathBuf> {
@@ -1259,6 +1345,149 @@ fn project_root_from(config_path: Option<&Path>, input_path: &Path) -> PathBuf {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn run_check(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let (project_config, config_report) =
+        validate_project_config_for_check(&project_root, config_path.as_deref());
+
+    let resolved_input = resolve_spec_input_path(&input_path, &project_config);
+    let (specs, discovery_report) = discover_specs_for_check(&resolved_input);
+    let metadata_report = validate_metadata_for_specs(&specs, &project_config);
+    let lint_data = collect_spec_lint_data(&specs);
+    let asset_report = validate_asset_references(&specs, &lint_data);
+    let cross_report = validate_cross_references(&specs, &lint_data);
+    let doc_success = format!(
+        "Found {} specification{}",
+        specs.len(),
+        if specs.len() == 1 { "" } else { "s" }
+    );
+
+    let mut total_errors = 0usize;
+    let mut total_warnings = 0usize;
+
+    println!("Checking configuration...");
+    let (errors, warnings) = print_category_report(&config_report, "Configuration is valid");
+    total_errors += errors;
+    total_warnings += warnings;
+
+    println!();
+    println!("Checking documents...");
+    let (errors, warnings) = print_category_report(&discovery_report, &doc_success);
+    total_errors += errors;
+    total_warnings += warnings;
+
+    println!();
+    println!("Checking metadata...");
+    let (errors, warnings) = print_category_report(&metadata_report, "All metadata is valid");
+    total_errors += errors;
+    total_warnings += warnings;
+
+    println!();
+    println!("Checking asset references...");
+    let (errors, warnings) = print_category_report(&asset_report, "All asset references are valid");
+    total_errors += errors;
+    total_warnings += warnings;
+
+    println!();
+    println!("Checking cross-references...");
+    let (errors, warnings) = print_category_report(&cross_report, "All cross-references are valid");
+    total_errors += errors;
+    total_warnings += warnings;
+
+    println!(
+        "Summary: {} errors, {} warnings",
+        total_errors, total_warnings
+    );
+
+    if total_errors > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn run_list(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+    let resolved_input = resolve_spec_input_path(&input_path, &project_config);
+    let mut load_result = load_specs(&resolved_input, &project_config)?;
+    load_result
+        .specs
+        .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.title.cmp(&b.title)));
+
+    let display_prefix = project_config.prefix.unwrap_or_default();
+    let use_color = supports_color();
+
+    if load_result.specs.is_empty() {
+        println!("No specifications found");
+        return Ok(());
+    }
+
+    for spec in load_result.specs {
+        print_list_entry(&spec, &display_prefix, use_color);
+        println!();
+    }
+
+    Ok(())
+}
+
+fn print_list_entry(spec: &SpecDocument, display_prefix: &str, use_color: bool) {
+    let bold_start = if use_color { "\u{001b}[1m" } else { "" };
+    let bold_end = if use_color { "\u{001b}[22m" } else { "" };
+    let bullet = if use_color {
+        "\u{001b}[90m•\u{001b}[0m"
+    } else {
+        "•"
+    };
+
+    let display_id = format!("{display_prefix}{}", spec.id);
+    println!("{bullet} {display_id} {bold_start}{}{bold_end}", spec.title);
+
+    let status = color_status(&spec.status, use_color);
+    let created = format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into());
+    let updated = format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into());
+    println!("  {status}, created: {created}, updated: {updated}");
+}
+
+fn color_status(status: &str, use_color: bool) -> String {
+    if !use_color {
+        return status.to_string();
+    }
+
+    let reset = "\u{001b}[0m";
+    let fg = match status.to_ascii_uppercase().as_str() {
+        "PUBLISHED" => "\u{001b}[32m",
+        "DRAFT" | "REVIEW" => "\u{001b}[33m",
+        "ABANDONED" => "\u{001b}[90m",
+        _ => "\u{001b}[36m",
+    };
+
+    format!("{fg}{status}{reset}")
+}
+
+fn print_category_report(report: &CategoryReport, success_message: &str) -> (usize, usize) {
+    if report.errors.is_empty() && report.warnings.is_empty() {
+        println!("✓ {}", success_message);
+        return (0, 0);
+    }
+
+    for entry in &report.errors {
+        println!("✗ {}", entry.message);
+        if let Some(location) = &entry.location {
+            println!("  {}", location);
+        }
+    }
+
+    for entry in &report.warnings {
+        println!("! {}", entry.message);
+        if let Some(location) = &entry.location {
+            println!("  {}", location);
+        }
+    }
+
+    (report.errors.len(), report.warnings.len())
 }
 
 async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
@@ -1901,6 +2130,7 @@ fn build_app_state(
     project_config: ProjectConfiguration,
 ) -> Result<(AppState, Vec<StaticMount>)> {
     let (specs, static_mounts) = load_and_sort_specs(input_path, &project_config)?;
+    let generated_at = chrono::Utc::now().timestamp_millis();
     let spec_ids = specs.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
     let renderer = DocRenderer::new();
     let specs_by_id = specs
@@ -1918,6 +2148,7 @@ fn build_app_state(
         site_name,
         site_description: project_config.description.unwrap_or_default(),
         extra_fields: project_config.extra_metadata_fields.clone(),
+        generated_at,
         assets,
         renderer,
     };
@@ -2248,6 +2479,7 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -2405,6 +2637,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -2465,6 +2698,7 @@ fn render_author(
         },
         content,
         prefix,
+        state.generated_at,
     )
 }
 
@@ -2508,6 +2742,16 @@ struct LayoutAssets<'a> {
     theme_toggle_js: &'a str,
 }
 
+fn format_generated_at(timestamp: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp)
+        .single()
+        .unwrap_or_else(Local::now)
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn base_layout(
     site_name: &str,
     site_description: &str,
@@ -2516,6 +2760,7 @@ fn base_layout(
     assets: LayoutAssets,
     content: Markup,
     prefix: &str,
+    generated_at: i64,
 ) -> Markup {
     let LayoutAssets {
         css,
@@ -2524,6 +2769,8 @@ fn base_layout(
     } = assets;
     let home_href = join_prefix(prefix, "");
     let favicon_href = join_prefix(prefix, "favicon.svg");
+    let version = env!("CARGO_PKG_VERSION");
+    let formatted_generated_at = format_generated_at(generated_at);
     html! {
         (PreEscaped("<!doctype html>"))
         html lang="en" {
@@ -2558,7 +2805,10 @@ fn base_layout(
                 (content)
                 footer class="site-footer" {
                     div class="container" {
-                        span { "Powered by Dossiers" }
+                        "Powered by "
+                        a href="https://dossie.rs" { "Dossiers" }
+                        " v" (version)
+                        span class="footer-label" { " • Built " (formatted_generated_at) }
                     }
                 }
                 script { (PreEscaped(theme_toggle_js)) }
@@ -3424,14 +3674,18 @@ fn resolve_site_name(_project_root: &Path, project_config: &ProjectConfiguration
     "Dossiers".into()
 }
 
+fn resolve_config_path(project_root: &Path, override_path: Option<&Path>) -> Option<PathBuf> {
+    override_path.map(|p| p.to_path_buf()).or_else(|| {
+        let default = project_root.join("dossiers.toml");
+        default.exists().then_some(default)
+    })
+}
+
 fn load_project_configuration(
     project_root: &Path,
     override_path: Option<&Path>,
 ) -> ProjectConfiguration {
-    let config_path = override_path.map(|p| p.to_path_buf()).or_else(|| {
-        let default = project_root.join("dossiers.toml");
-        default.exists().then_some(default)
-    });
+    let config_path = resolve_config_path(project_root, override_path);
 
     let Some(path) = config_path else {
         return ProjectConfiguration::default();
@@ -3465,6 +3719,732 @@ fn parse_toml_config(raw: &str, path: &Path) -> Result<Value, String> {
         .map_err(|err| format!("TOML parse error: {err}"))
         .and_then(|value| serde_json::to_value(value).map_err(|err| err.to_string()))
         .map_err(|err| format!("failed to parse config {}: {err}", path.display()))
+}
+
+fn validate_project_config_for_check(
+    project_root: &Path,
+    override_path: Option<&Path>,
+) -> (ProjectConfiguration, CategoryReport) {
+    let mut report = CategoryReport::default();
+    let config_path = resolve_config_path(project_root, override_path);
+    let Some(path) = config_path else {
+        return (ProjectConfiguration::default(), report);
+    };
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            report.add_error(
+                format!(
+                    "Failed to read project configuration at {}: {err}",
+                    path.display()
+                ),
+                None,
+            );
+            return (ProjectConfiguration::default(), report);
+        }
+    };
+
+    let value = match parse_toml_config(&raw, &path) {
+        Ok(value) => value,
+        Err(err) => {
+            report.add_error(
+                format!("Failed to parse configuration at {}: {err}", path.display()),
+                None,
+            );
+            return (ProjectConfiguration::default(), report);
+        }
+    };
+
+    let config = ProjectConfiguration::from_json_value(&value);
+    validate_config_value(&value, &config, &mut report, &path);
+
+    (config, report)
+}
+
+fn validate_config_value(
+    raw_value: &Value,
+    config: &ProjectConfiguration,
+    report: &mut CategoryReport,
+    path: &Path,
+) {
+    if let Some(statuses) = raw_value
+        .get("statuses")
+        .or_else(|| raw_value.get("statusList"))
+        .and_then(Value::as_array)
+    {
+        for (idx, status) in statuses.iter().enumerate() {
+            let valid = status
+                .as_str()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !valid {
+                report.add_error(
+                    format!("Status entry #{idx} must be a non-empty string"),
+                    Some(path.display().to_string()),
+                );
+            }
+        }
+    }
+
+    if let Some(default_status) = config.default_status.as_ref() {
+        if !config.statuses.is_empty() && !config.statuses.contains(default_status) {
+            report.add_error(
+                format!(
+                    "default_status '{}' is not included in statuses",
+                    default_status
+                ),
+                Some(path.display().to_string()),
+            );
+        }
+    }
+
+    if let Some(fields) = raw_value
+        .get("extraMetadataFields")
+        .or_else(|| raw_value.get("extra_metadata_fields"))
+        .and_then(Value::as_array)
+    {
+        for (idx, value) in fields.iter().enumerate() {
+            let Some(map) = value.as_object() else {
+                report.add_error(
+                    format!("extra_metadata_fields[{idx}] must be a table"),
+                    Some(path.display().to_string()),
+                );
+                continue;
+            };
+
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if name.is_none() {
+                report.add_error(
+                    format!("extra_metadata_fields[{idx}] is missing a non-empty name"),
+                    Some(path.display().to_string()),
+                );
+            }
+
+            let type_hint = map
+                .get("type")
+                .or_else(|| map.get("type_hint"))
+                .or_else(|| map.get("typeHint"))
+                .and_then(Value::as_str);
+
+            match type_hint {
+                Some(raw) if is_valid_metadata_type(raw) => {}
+                Some(raw) => report.add_error(
+                    format!("extra_metadata_fields[{idx}] has invalid type '{}'", raw),
+                    Some(path.display().to_string()),
+                ),
+                None => report.add_error(
+                    format!("extra_metadata_fields[{idx}] is missing a type"),
+                    Some(path.display().to_string()),
+                ),
+            }
+        }
+    }
+
+    for (alias, target) in &config.field_aliases {
+        let canonical = canonicalize_field_key(alias);
+        if matches!(
+            canonical.as_str(),
+            "title" | "status" | "created" | "updated" | "lastupdated"
+        ) {
+            report.add_warning(
+                format!(
+                    "Field alias '{}' for '{}' conflicts with a standard field name",
+                    alias, target
+                ),
+                Some(path.display().to_string()),
+            );
+        }
+    }
+}
+
+fn canonicalize_field_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn is_valid_metadata_type(raw: &str) -> bool {
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "string" | "number" | "boolean" | "date" | "markdown"
+    )
+}
+
+fn discover_specs_for_check(input_root: &Path) -> (Vec<LintSpec>, CategoryReport) {
+    let mut report = CategoryReport::default();
+    let mut specs = Vec::new();
+
+    if !input_root.exists() {
+        report.add_error(
+            format!(
+                "Specification directory not found: {}",
+                input_root.display()
+            ),
+            None,
+        );
+        return (specs, report);
+    }
+
+    if !input_root.is_dir() {
+        report.add_error(
+            format!("Provided path is not a directory: {}", input_root.display()),
+            None,
+        );
+        return (specs, report);
+    }
+
+    let mut candidates: HashMap<String, Vec<(String, PathBuf, DocFormat, PathBuf)>> =
+        HashMap::new();
+
+    let entries = match fs::read_dir(input_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            report.add_error(
+                format!(
+                    "Failed to read specification directory {}: {err}",
+                    input_root.display()
+                ),
+                None,
+            );
+            return (specs, report);
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(id) = extract_spec_id(&name) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            match find_doc_file(&path) {
+                Ok((doc_path, format)) => {
+                    candidates.entry(id).or_default().push((
+                        name.clone(),
+                        doc_path,
+                        format,
+                        path.clone(),
+                    ));
+                }
+                Err(_) => {
+                    report.add_error(
+                        format!(
+                            "Directory {} matches the expected pattern but has no document",
+                            path.display()
+                        ),
+                        None,
+                    );
+                }
+            }
+            continue;
+        }
+
+        if path.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+
+            let format = match ext.as_str() {
+                "md" | "markdown" => Some(DocFormat::Markdown),
+                "adoc" | "asciidoc" => Some(DocFormat::Asciidoc),
+                _ => None,
+            };
+
+            if let Some(format) = format {
+                let dir_name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(&name)
+                    .to_string();
+                let spec_root = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| input_root.to_path_buf());
+
+                candidates
+                    .entry(id)
+                    .or_default()
+                    .push((dir_name, path.clone(), format, spec_root));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        report.add_error(
+            format!(
+                "No spec documents found in {} (expected subdirectories like 0001-* or files like 0001-*.md)",
+                input_root.display()
+            ),
+            None,
+        );
+        return (specs, report);
+    }
+
+    for (spec_id, entries) in &candidates {
+        if entries.len() > 1 {
+            let paths = entries
+                .iter()
+                .map(|(_, path, _, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            report.add_error(
+                format!("Duplicate specification ID {} in {}", spec_id, paths),
+                None,
+            );
+        }
+
+        for (dir_name, doc_path, format, spec_root) in entries {
+            match fs::read_to_string(doc_path) {
+                Ok(source) => {
+                    specs.push(LintSpec {
+                        id: spec_id.clone(),
+                        dir_name: dir_name.clone(),
+                        doc_path: doc_path.clone(),
+                        spec_root: spec_root.clone(),
+                        source,
+                        format: *format,
+                    });
+                }
+                Err(err) => {
+                    report.add_error(
+                        format!("Failed to read {}: {err}", doc_path.display()),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    (specs, report)
+}
+
+fn validate_metadata_for_specs(
+    specs: &[LintSpec],
+    project_config: &ProjectConfiguration,
+) -> CategoryReport {
+    let mut report = CategoryReport::default();
+    if specs.is_empty() {
+        return report;
+    }
+
+    let reader = MetadataReader::new(project_config.clone());
+
+    for spec in specs {
+        if matches!(spec.format, DocFormat::Markdown) {
+            if let Some(issue) = detect_frontmatter_issue(&spec.source) {
+                report.add_error(
+                    format!("Malformed frontmatter in {}", spec.doc_path.display()),
+                    Some(issue),
+                );
+            }
+        }
+
+        let display_name = display_name_from_dir(&spec.dir_name);
+        let parsed = reader.read(&spec.source, spec.format, &display_name);
+        let metadata = parsed.metadata;
+
+        let missing_title = metadata
+            .title
+            .as_ref()
+            .map(|t| t.trim().is_empty())
+            .unwrap_or(true);
+        if missing_title {
+            report.add_error(
+                format!("Missing title in {}", spec.doc_path.display()),
+                None,
+            );
+        }
+
+        if !project_config.statuses.is_empty() {
+            let resolved_status = reader.resolve_status(metadata.status.clone(), false);
+            if !resolved_status.is_empty() && !project_config.statuses.contains(&resolved_status) {
+                report.add_error(
+                    format!(
+                        "Invalid status '{}' in {} (allowed: {})",
+                        resolved_status,
+                        spec.doc_path.display(),
+                        project_config.statuses.join(", ")
+                    ),
+                    None,
+                );
+            }
+        }
+
+        for (field, raw) in [
+            ("created", metadata.created.as_deref()),
+            ("updated", metadata.updated.as_deref()),
+        ] {
+            if let Some(value) = raw {
+                if parse_date(value).is_none() {
+                    report.add_warning(
+                        format!(
+                            "Unparseable date '{}' for field '{}' in {}",
+                            value,
+                            field,
+                            spec.doc_path.display()
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    report
+}
+
+fn collect_spec_lint_data(specs: &[LintSpec]) -> HashMap<String, SpecLintData> {
+    let mut data = HashMap::new();
+    let renderer = DocRenderer::new();
+
+    for spec in specs {
+        let (assets, cross_refs) = collect_references(&spec.source, spec.format);
+        let anchors = extract_heading_ids(&renderer, &spec.source, spec.format);
+        data.insert(
+            spec.id.clone(),
+            SpecLintData {
+                anchors,
+                assets,
+                cross_refs,
+            },
+        );
+    }
+
+    data
+}
+
+fn validate_asset_references(
+    specs: &[LintSpec],
+    lint_data: &HashMap<String, SpecLintData>,
+) -> CategoryReport {
+    let mut report = CategoryReport::default();
+
+    for spec in specs {
+        let Some(data) = lint_data.get(&spec.id) else {
+            continue;
+        };
+
+        for asset in &data.assets {
+            let (path_only, _) = split_target(&asset.path);
+            if path_only.is_empty() {
+                continue;
+            }
+
+            let resolved = spec.spec_root.join(&path_only);
+            if !resolved.exists() {
+                report.add_error(
+                    format!("Missing asset: {}", path_only),
+                    Some(format!(
+                        "Referenced in: {}:{}",
+                        spec.doc_path.display(),
+                        asset.line
+                    )),
+                );
+            }
+        }
+    }
+
+    report
+}
+
+fn validate_cross_references(
+    specs: &[LintSpec],
+    lint_data: &HashMap<String, SpecLintData>,
+) -> CategoryReport {
+    let mut report = CategoryReport::default();
+    let available: HashSet<String> = specs.iter().map(|spec| spec.id.clone()).collect();
+    let empty: Vec<String> = Vec::new();
+
+    for spec in specs {
+        let Some(data) = lint_data.get(&spec.id) else {
+            continue;
+        };
+
+        for reference in &data.cross_refs {
+            if !available.contains(&reference.target_spec) {
+                report.add_error(
+                    format!("Broken reference: {}", reference.raw),
+                    Some(format!(
+                        "Referenced in: {}:{}",
+                        spec.doc_path.display(),
+                        reference.line
+                    )),
+                );
+                continue;
+            }
+
+            if let Some(anchor) = reference.anchor.as_ref() {
+                let anchors = lint_data
+                    .get(&reference.target_spec)
+                    .map(|d| &d.anchors)
+                    .unwrap_or(&empty);
+
+                if !anchors.iter().any(|candidate| candidate == anchor) {
+                    report.add_error(
+                        format!("Broken anchor: {}", reference.raw),
+                        Some(format!(
+                            "Referenced in: {}:{}",
+                            spec.doc_path.display(),
+                            reference.line
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    report
+}
+
+fn collect_references(
+    source: &str,
+    format: DocFormat,
+) -> (Vec<AssetReference>, Vec<CrossReference>) {
+    let raw_refs = match format {
+        DocFormat::Markdown => collect_markdown_references(source),
+        DocFormat::Asciidoc => collect_asciidoc_references(source),
+    };
+
+    let mut assets = Vec::new();
+    let mut cross_refs = Vec::new();
+
+    for (target, line) in raw_refs {
+        match classify_reference(&target) {
+            Some(ReferenceKind::Asset(path)) => assets.push(AssetReference { path, line }),
+            Some(ReferenceKind::Cross {
+                raw,
+                target_spec,
+                anchor,
+            }) => cross_refs.push(CrossReference {
+                raw,
+                target_spec,
+                anchor,
+                line,
+            }),
+            None => {}
+        }
+    }
+
+    (assets, cross_refs)
+}
+
+fn collect_markdown_references(source: &str) -> Vec<(String, usize)> {
+    let mut options = MdOptions::empty();
+    options.insert(MdOptions::ENABLE_TABLES);
+    options.insert(MdOptions::ENABLE_FOOTNOTES);
+
+    Parser::new_ext(source, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            pulldown_cmark::Event::Start(Tag::Link { dest_url, .. })
+            | pulldown_cmark::Event::Start(Tag::Image { dest_url, .. }) => Some((
+                dest_url.to_string(),
+                line_number_from_offset(source, range.start),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_asciidoc_references(source: &str) -> Vec<(String, usize)> {
+    lazy_static! {
+        static ref ASCIIDOC_REF_RE: Regex =
+            Regex::new(r"(?m)(?:image|link|xref)::?([^\s\[]+)\[").unwrap();
+    }
+
+    ASCIIDOC_REF_RE
+        .captures_iter(source)
+        .filter_map(|caps| {
+            let m = caps.get(1)?;
+            let target = m.as_str().to_string();
+            let line = line_number_from_offset(source, m.start());
+            Some((target, line))
+        })
+        .collect()
+}
+
+enum ReferenceKind {
+    Asset(String),
+    Cross {
+        raw: String,
+        target_spec: String,
+        anchor: Option<String>,
+    },
+}
+
+fn classify_reference(target: &str) -> Option<ReferenceKind> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    if is_external_target(trimmed) || trimmed.starts_with('/') {
+        return None;
+    }
+
+    lazy_static! {
+        static ref SPEC_REF_RE: Regex = Regex::new(
+            r#"(?i)^(?:\.\./)+(?:specs/)?(\d{4,})-[^/]+/[^#?]*?(?:\.adoc|\.md)?(#[-A-Za-z0-9_]+)?$"#
+        )
+        .unwrap();
+    }
+
+    if let Some(caps) = SPEC_REF_RE.captures(trimmed) {
+        let spec_id = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let anchor = caps
+            .get(2)
+            .map(|m| m.as_str().trim_start_matches('#').to_string())
+            .filter(|s| !s.is_empty());
+
+        return Some(ReferenceKind::Cross {
+            raw: trimmed.to_string(),
+            target_spec: spec_id,
+            anchor,
+        });
+    }
+
+    let (path, _) = split_target(trimmed);
+    if path.is_empty() {
+        None
+    } else {
+        Some(ReferenceKind::Asset(path))
+    }
+}
+
+fn split_target(raw: &str) -> (String, Option<String>) {
+    let mut parts = raw.split('#');
+    let path = parts
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let anchor = parts
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    (path, anchor)
+}
+
+fn is_external_target(target: &str) -> bool {
+    lazy_static! {
+        static ref SCHEME_RE: Regex = Regex::new(r"(?i)^[a-z][a-z0-9+.\-]*:").unwrap();
+    }
+
+    target.starts_with("//") || SCHEME_RE.is_match(target)
+}
+
+fn extract_heading_ids(renderer: &DocRenderer, source: &str, format: DocFormat) -> Vec<String> {
+    lazy_static! {
+        static ref HEADING_RE: Regex =
+            Regex::new(r"(?is)<h([1-6])([^>]*)>(.*?)</h([1-6])\s*>").unwrap();
+        static ref ID_RE: Regex = Regex::new(r#"id\s*=\s*["']([^"']+)["']"#).unwrap();
+    }
+
+    let rendered = renderer
+        .render(source, format)
+        .unwrap_or_else(|_| render_plaintext(source));
+    let cleaned = remove_leading_heading(&rendered);
+    let mut anchors = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+
+    for caps in HEADING_RE.captures_iter(&cleaned) {
+        let level: usize = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let closing_level: usize = caps
+            .get(4)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(level);
+        if level != closing_level || !(2..=4).contains(&level) {
+            continue;
+        }
+
+        let attrs = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let text = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let base = slugify_heading_id(&strip_html_tags(text));
+        let mut candidate = ID_RE
+            .captures(attrs)
+            .and_then(|m| m.get(1).map(|m| m.as_str().trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| base.clone());
+
+        let mut index = 2;
+        while candidate.is_empty() || used.contains(&candidate) {
+            candidate = format!("{base}-{index}");
+            index += 1;
+        }
+
+        used.insert(candidate.clone());
+        anchors.push(candidate);
+    }
+
+    anchors
+}
+
+fn slugify_heading_id(text: &str) -> String {
+    lazy_static! {
+        static ref SLUG_RE: Regex = Regex::new(r"[^\w]+").unwrap();
+    }
+    let lowered = text.to_lowercase().trim().to_string();
+    let slug = SLUG_RE
+        .replace_all(&lowered, "-")
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "section".to_string()
+    } else {
+        slug
+    }
+}
+
+fn strip_html_tags(raw: &str) -> String {
+    lazy_static! {
+        static ref TAG_RE: Regex = Regex::new(r"(?is)<[^>]+>").unwrap();
+    }
+    TAG_RE.replace_all(raw, "").to_string()
+}
+
+fn line_number_from_offset(source: &str, offset: usize) -> usize {
+    source[..offset].lines().count() + 1
+}
+
+fn detect_frontmatter_issue(source: &str) -> Option<String> {
+    let mut lines = source.split_inclusive('\n');
+    let first_line = lines.next()?;
+    if first_line.trim() != "---" {
+        return None;
+    }
+
+    let mut block = String::new();
+    for line in lines {
+        if line.trim() == "---" {
+            if serde_yaml::from_str::<serde_yaml::Value>(&block).is_err() {
+                return Some("Frontmatter block is not valid YAML".to_string());
+            }
+            return None;
+        }
+        block.push_str(line);
+    }
+
+    Some("Frontmatter block is not terminated with ---".to_string())
 }
 
 #[cfg(test)]
