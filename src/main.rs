@@ -3,14 +3,14 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod metadata;
 
 use actix_files::Files;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use anyhow::{bail, Context, Result};
+use actix_web::{rt::task, web, App, HttpResponse, HttpServer, Responder};
+use anyhow::{anyhow, bail, Context, Result};
 use asciidoc_parser::{
     blocks::{
         Block as AsciidocBlock, Break as AsciidocBreak, BreakType, CompoundDelimitedBlock,
@@ -20,8 +20,9 @@ use asciidoc_parser::{
     document::Document as AsciidocDocument,
     Parser as AsciidocParser,
 };
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate, TimeZone, Utc};
 use dossiers::git_utils::{open_git_repository, GitTimestampCache};
+use dossiers::github::{parse_github_repo, GithubClient, GithubFile, GithubPull};
 use lazy_static::lazy_static;
 use maud::{html, Markup, PreEscaped};
 use metadata::{
@@ -94,6 +95,9 @@ struct SpecDocument {
     extra: HashMap<String, Value>,
     source: String,
     format: DocFormat,
+    listed: bool,
+    revision_of: Option<String>,
+    pr_number: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -344,6 +348,7 @@ struct AppState {
     specs: Vec<SpecDocument>,
     specs_by_id: HashMap<String, SpecDocument>,
     spec_ids: HashSet<String>,
+    revisions: HashMap<String, Vec<RevisionLink>>,
     display_prefix: String,
     site_name: String,
     site_description: String,
@@ -354,6 +359,13 @@ struct AppState {
 }
 
 type StaticMount = (String, PathBuf);
+
+#[derive(Clone)]
+struct RevisionLink {
+    pr_number: u64,
+    status: String,
+    href: String,
+}
 
 struct LoadResult {
     specs: Vec<SpecDocument>,
@@ -876,7 +888,7 @@ fn load_specs_from_directory(
 
         let updated_sort = updated
             .or(created)
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
 
         let git_managed = git_repo.is_some() && (git_addition.is_some() || git_change.is_some());
         let status = metadata_reader.resolve_status(pending.status.clone(), git_managed);
@@ -894,6 +906,9 @@ fn load_specs_from_directory(
             extra: pending.extra,
             source: pending.body,
             format: pending.format,
+            listed: true,
+            revision_of: None,
+            pr_number: None,
         });
     }
 
@@ -988,6 +1003,12 @@ fn load_and_sort_specs(
     Ok((load_result.specs, load_result.static_mounts))
 }
 
+fn insert_spec_document(state: &mut AppState, spec: SpecDocument) {
+    state.spec_ids.insert(spec.id.clone());
+    state.specs_by_id.insert(spec.id.clone(), spec.clone());
+    state.specs.push(spec);
+}
+
 fn spec_document_to_generated_spec(spec: SpecDocument) -> GeneratedSpec {
     GeneratedSpec {
         id: spec.id,
@@ -1065,7 +1086,9 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             input_path,
             output_dir,
         } => {
-            run_build(input_path, output_dir, config_path)?;
+            task::spawn_blocking(move || run_build(input_path, output_dir, config_path))
+                .await
+                .map_err(|err| anyhow!("build task failed: {err}"))??;
             Ok(())
         }
         CliCommand::Check(input_path) => run_check(input_path, config_path),
@@ -1536,7 +1559,24 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     let assets = Assets::embedded();
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (state, static_mounts) = build_app_state(&input_path, site_name, assets, project_config)?;
+    let (mut state, mut static_mounts) =
+        build_app_state(&input_path, site_name, assets, project_config.clone())?;
+
+    if let Err(err) = augment_with_pull_requests(
+        &mut state,
+        &mut static_mounts,
+        &input_path,
+        &project_root,
+        &project_config,
+    ) {
+        eprintln!("Warning: failed to incorporate pull request revisions: {err}");
+    }
+
+    state.specs.sort_by(|a, b| {
+        b.updated_sort
+            .cmp(&a.updated_sort)
+            .then_with(|| b.id.cmp(&a.id))
+    });
 
     if output_dir.exists() {
         fs::remove_dir_all(&output_dir)
@@ -1591,6 +1631,499 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     Ok(())
 }
 
+fn augment_with_pull_requests(
+    state: &mut AppState,
+    static_mounts: &mut Vec<StaticMount>,
+    input_path: &Path,
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+) -> Result<()> {
+    let token = match env::var("GITHUB_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("Skipping PR revisions: GITHUB_TOKEN not set.");
+            return Ok(());
+        }
+    };
+
+    let git_repo = open_git_repository(project_root);
+    let repo_root = git_repo
+        .as_ref()
+        .map(|repo| repo.workdir().to_path_buf())
+        .unwrap_or_else(|| project_root.to_path_buf());
+
+    let repo_from_config = project_config
+        .repository
+        .as_deref()
+        .and_then(parse_github_repo);
+    let repo_from_git = git_repo
+        .as_ref()
+        .and_then(|repo| repo.remote_url())
+        .as_deref()
+        .and_then(parse_github_repo);
+
+    let Some(github_repo) = repo_from_config.or(repo_from_git) else {
+        eprintln!("Skipping PR revisions: no GitHub repository found in config or git remotes.");
+        return Ok(());
+    };
+    eprintln!(
+        "Using GitHub repository {}/{} for PR revisions.",
+        github_repo.owner, github_repo.name
+    );
+
+    let spec_root = resolve_spec_input_path(input_path, project_config);
+    let Some(spec_root_relative) = relative_to(&spec_root, &repo_root) else {
+        eprintln!(
+            "Warning: unable to relate spec root {} to repository root {}; skipping pull request previews.",
+            spec_root.display(),
+            repo_root.display()
+        );
+        return Ok(());
+    };
+
+    let client = GithubClient::new(github_repo, &token)
+        .context("creating GitHub client for pull request previews")?;
+    let pulls = client
+        .list_open_pulls()
+        .context("listing open GitHub pull requests")?;
+
+    if pulls.is_empty() {
+        eprintln!("No open pull requests found for preview.");
+        return Ok(());
+    }
+    eprintln!("Found {} open pull request(s).", pulls.len());
+
+    let metadata_reader = MetadataReader::new(project_config.clone());
+    for pull in pulls {
+        eprintln!("Inspecting PR #{} for revisions...", pull.number);
+        let files = match client.list_pull_files(pull.number) {
+            Ok(files) => files,
+            Err(err) => {
+                eprintln!("Warning: skipping PR #{}: {err}", pull.number);
+                continue;
+            }
+        };
+        eprintln!(
+            "PR #{} contains {} file change(s).",
+            pull.number,
+            files.len()
+        );
+
+        let Some(targets) = map_pull_to_specs(
+            &files,
+            &spec_root_relative,
+            pull.number,
+            project_config.pr_number_as_spec_id,
+        ) else {
+            eprintln!(
+                "Skipping PR #{}: no eligible spec changes. Files: {}",
+                pull.number,
+                files
+                    .iter()
+                    .map(|f| f.filename.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            continue;
+        };
+        eprintln!(
+            "PR #{} maps to {} spec target(s).",
+            pull.number,
+            targets.len()
+        );
+
+        for target in targets {
+            eprintln!(
+                "PR #{} -> spec {} at {}",
+                pull.number,
+                target.spec_id,
+                target.primary_relative.display()
+            );
+            if target.used_pr_id {
+                eprintln!(
+                    "PR #{} is mapped as a new draft spec using PR number {}.",
+                    pull.number, target.spec_id
+                );
+            }
+
+            if let Err(err) = build_pr_spec_version(
+                state,
+                static_mounts,
+                &client,
+                &metadata_reader,
+                &pull,
+                &files,
+                &target.spec_id,
+                &target.spec_relative_dir,
+                &spec_root,
+                &spec_root_relative,
+                project_root,
+                &target.primary_relative,
+            ) {
+                eprintln!(
+                    "Warning: failed to build PR #{} preview for {}: {err}",
+                    pull.number, target.spec_id
+                );
+            } else {
+                let base_spec_exists = state.specs_by_id.contains_key(&target.spec_id);
+                if base_spec_exists {
+                    eprintln!(
+                        "Added PR #{} as revision for existing spec {}.",
+                        pull.number, target.spec_id
+                    );
+                } else {
+                    eprintln!(
+                        "Added PR #{} as new spec {} (listed in index).",
+                        pull.number, target.spec_id
+                    );
+                }
+            }
+        }
+    }
+
+    for revisions in state.revisions.values_mut() {
+        revisions.sort_by_key(|rev| rev.pr_number);
+    }
+
+    Ok(())
+}
+
+struct SpecTarget {
+    spec_id: String,
+    spec_relative_dir: PathBuf,
+    primary_relative: PathBuf,
+    used_pr_id: bool,
+}
+
+fn map_pull_to_specs(
+    files: &[GithubFile],
+    spec_root_relative: &Path,
+    pr_number: u64,
+    pr_number_as_spec_id: bool,
+) -> Option<Vec<SpecTarget>> {
+    let mut ignored_non_spec = 0usize;
+    let pr_id = format!("{pr_number:04}");
+    let mut primary_relative: Option<PathBuf> = None;
+    let mut targets: Vec<SpecTarget> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for file in files {
+        let repo_path = Path::new(&file.filename);
+        let Some((current_id, relative_path)) =
+            spec_id_from_repo_path(repo_path, spec_root_relative)
+        else {
+            ignored_non_spec += 1;
+            continue;
+        };
+        let target_id = if pr_number_as_spec_id && (current_id == "0000" || current_id == pr_id) {
+            pr_id.clone()
+        } else {
+            current_id.clone()
+        };
+
+        let target_dir =
+            spec_dir_for_relative_path(&relative_path, &current_id).unwrap_or_default();
+        let primary = relative_path.clone();
+
+        if seen_ids.insert(target_id.clone()) {
+            targets.push(SpecTarget {
+                spec_id: target_id,
+                spec_relative_dir: target_dir,
+                primary_relative: primary,
+                used_pr_id: pr_number_as_spec_id && (current_id == "0000" || current_id == pr_id),
+            });
+        }
+
+        if primary_relative.is_none() {
+            primary_relative = Some(relative_path);
+        }
+    }
+
+    if targets.is_empty() {
+        eprintln!(
+            "Skipping PR mapping: no spec files under {} were touched (ignored {} non-spec file(s)).",
+            spec_root_relative.display(),
+            ignored_non_spec
+        );
+        return None;
+    }
+
+    Some(targets)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_pr_spec_version(
+    state: &mut AppState,
+    static_mounts: &mut Vec<StaticMount>,
+    client: &GithubClient,
+    metadata_reader: &MetadataReader,
+    pull: &GithubPull,
+    files: &[GithubFile],
+    spec_id: &str,
+    spec_relative_dir: &Path,
+    spec_root: &Path,
+    spec_root_relative: &Path,
+    project_root: &Path,
+    primary_relative: &Path,
+) -> Result<()> {
+    let workspace_root = project_root
+        .join("target")
+        .join("pr-previews")
+        .join(format!("pr-{}", pull.number));
+    if workspace_root.exists() {
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+    let spec_root_temp = workspace_root.join("specs");
+    let target_doc = spec_root_temp.join(primary_relative);
+    if let Some(parent) = target_doc.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace for PR #{}", pull.number))?;
+    } else {
+        fs::create_dir_all(&spec_root_temp)
+            .with_context(|| format!("creating workspace for PR #{}", pull.number))?;
+    }
+
+    let local_doc = spec_root.join(primary_relative);
+    if local_doc.exists() && local_doc.is_file() {
+        fs::copy(&local_doc, &target_doc)
+            .with_context(|| format!("copying baseline document {}", local_doc.display()))?;
+    } else if !spec_relative_dir.as_os_str().is_empty() {
+        let local_spec_dir = spec_root.join(spec_relative_dir);
+        if local_spec_dir.exists() && local_spec_dir.is_dir() {
+            copy_dir_contents(&local_spec_dir, &spec_root_temp.join(spec_relative_dir))?;
+        }
+    }
+
+    for file in files {
+        if let Some(previous) = file.previous_filename.as_ref() {
+            let previous_path = Path::new(previous);
+            if let Some(relative) = relative_to_spec_root(previous_path, spec_root_relative) {
+                let target = spec_root_temp.join(relative);
+                let _ = fs::remove_file(&target);
+            }
+        }
+
+        let repo_path = Path::new(&file.filename);
+        let Some(relative) = relative_to_spec_root(repo_path, spec_root_relative) else {
+            continue;
+        };
+        let target_path = spec_root_temp.join(relative);
+
+        if file.status == "removed" {
+            let _ = fs::remove_file(&target_path);
+            continue;
+        }
+
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let bytes = if let Some(raw_url) = file.raw_url.as_deref() {
+            match client.download_bytes(raw_url) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: raw download failed for {} (PR #{}): {err}; falling back to contents API.",
+                        file.filename, pull.number
+                    );
+                    client.download_file_at_ref(&file.filename, &pull.head_sha)?
+                }
+            }
+        } else {
+            client.download_file_at_ref(&file.filename, &pull.head_sha)?
+        };
+
+        fs::write(&target_path, &bytes)
+            .with_context(|| format!("writing PR file {}", target_path.display()))?;
+    }
+
+    let doc_root = spec_root_temp.join(primary_relative);
+    let (doc_path, format) = if doc_root.is_dir() {
+        find_doc_file(&doc_root)?
+    } else if doc_root.is_file() {
+        let ext = doc_root
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+        let format = match ext.as_str() {
+            "md" | "markdown" => DocFormat::Markdown,
+            "adoc" | "asciidoc" => DocFormat::Asciidoc,
+            _ => bail!(
+                "Unsupported document format for PR #{} at {}",
+                pull.number,
+                doc_root.display()
+            ),
+        };
+        (doc_root.clone(), format)
+    } else {
+        bail!(
+            "No document found for PR #{} in {}",
+            pull.number,
+            doc_root.display()
+        );
+    };
+
+    let dir_name = spec_relative_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(spec_id)
+        .to_string();
+    let display_name = display_name_from_dir(&dir_name);
+    let source = fs::read_to_string(&doc_path)
+        .with_context(|| format!("reading PR document {}", doc_path.display()))?;
+    let parsed = metadata_reader.read(&source, format, &display_name);
+    let meta = parsed.metadata;
+    let status_fallback = if pull.draft {
+        "DRAFT".to_string()
+    } else {
+        "REVIEW".to_string()
+    };
+
+    let meta_created = meta.created.as_deref().and_then(parse_date);
+    let meta_updated = meta.updated.as_deref().and_then(parse_date);
+    let authors = if meta.authors.is_empty() {
+        pull.author
+            .as_ref()
+            .map(|a| vec![a.clone()])
+            .unwrap_or_default()
+    } else {
+        meta.authors.clone()
+    };
+    let base_created = state.specs_by_id.get(spec_id).and_then(|spec| spec.created);
+    let base_updated = state.specs_by_id.get(spec_id).and_then(|spec| spec.updated);
+    let base_exists = state.specs_by_id.contains_key(spec_id);
+    let (file_created, file_modified) = file_timestamps(&doc_path);
+
+    let created = meta_created
+        .or(Some(pull.created_at))
+        .or(base_created)
+        .or(file_created)
+        .or(file_modified);
+    let updated = meta_updated
+        .or(Some(pull.updated_at))
+        .or(base_updated)
+        .or(file_modified)
+        .or(created)
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let updated_sort = updated;
+
+    let status = meta.status.unwrap_or(status_fallback);
+    let pr_id = if base_exists {
+        format!("{}/pr/{}", spec_id, pull.number)
+    } else {
+        spec_id.to_string()
+    };
+    let pr_spec = SpecDocument {
+        id: pr_id.clone(),
+        dir_name,
+        title: meta
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| display_name.clone()),
+        status,
+        created,
+        updated: Some(updated),
+        authors,
+        links: meta.links,
+        updated_sort,
+        extra: metadata_extra_to_json(&meta.extra),
+        source: parsed.body,
+        format,
+        listed: !base_exists,
+        revision_of: base_exists.then(|| spec_id.to_string()),
+        pr_number: Some(pull.number),
+    };
+
+    let mount_path = if base_exists {
+        format!("/{}/pr/{}", spec_id, pull.number)
+    } else {
+        format!("/{spec_id}")
+    };
+    let static_root = if doc_root.is_dir() {
+        doc_root.clone()
+    } else {
+        doc_root.parent().unwrap_or(&doc_root).to_path_buf()
+    };
+    static_mounts.push((mount_path, static_root));
+    insert_spec_document(state, pr_spec.clone());
+
+    if base_exists {
+        state
+            .revisions
+            .entry(spec_id.to_string())
+            .or_default()
+            .push(RevisionLink {
+                pr_number: pull.number,
+                status: pr_spec.status.clone(),
+                href: pr_spec.id.clone(),
+            });
+    }
+
+    Ok(())
+}
+
+fn spec_id_from_repo_path(path: &Path, spec_root_relative: &Path) -> Option<(String, PathBuf)> {
+    let stripped = relative_to_spec_root(path, spec_root_relative)?;
+    for component in stripped.components() {
+        if let Component::Normal(os) = component {
+            let Some(name) = os.to_str() else { continue };
+            if let Some(id) = extract_spec_id(name) {
+                return Some((id, stripped));
+            }
+        }
+    }
+
+    None
+}
+
+fn spec_dir_for_relative_path(path: &Path, spec_id: &str) -> Option<PathBuf> {
+    let mut accum = PathBuf::new();
+    let components = path.components().peekable();
+
+    for component in components {
+        let Component::Normal(os) = component else {
+            continue;
+        };
+        let name = os.to_str()?;
+        if let Some(id) = extract_spec_id(name) {
+            if id == spec_id {
+                accum.push(name);
+                return Some(accum);
+            }
+        }
+        accum.push(name);
+    }
+
+    None
+}
+
+fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
+    let path = path.canonicalize().ok()?;
+    let base = base.canonicalize().ok()?;
+    path.strip_prefix(base).map(|p| p.to_path_buf()).ok()
+}
+
+fn relative_to_spec_root(path: &Path, spec_root_relative: &Path) -> Option<PathBuf> {
+    if path.starts_with(spec_root_relative) {
+        if let Ok(stripped) = path.strip_prefix(spec_root_relative) {
+            return Some(stripped.to_path_buf());
+        }
+    }
+
+    if let Some(last) = spec_root_relative.components().next_back() {
+        let tail = PathBuf::from(last.as_os_str());
+        if path.starts_with(&tail) {
+            if let Ok(stripped) = path.strip_prefix(&tail) {
+                return Some(stripped.to_path_buf());
+            }
+        }
+    }
+
+    None
+}
+
 fn build_app_state(
     input_path: &Path,
     site_name: String,
@@ -1611,6 +2144,7 @@ fn build_app_state(
         specs,
         specs_by_id,
         spec_ids,
+        revisions: HashMap::new(),
         display_prefix: project_config.prefix.clone().unwrap_or_default(),
         site_name,
         site_description: project_config.description.unwrap_or_default(),
@@ -1860,9 +2394,11 @@ async fn author_page(
         .specs
         .iter()
         .filter(|spec| {
-            spec.authors
-                .iter()
-                .any(|author| slugify_author(author) == slug)
+            spec.listed
+                && spec
+                    .authors
+                    .iter()
+                    .any(|author| slugify_author(author) == slug)
         })
         .collect();
 
@@ -1882,6 +2418,7 @@ async fn author_page(
 fn render_index(state: &AppState, prefix: &str) -> Markup {
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
+    let listed_specs: Vec<&SpecDocument> = state.specs.iter().filter(|spec| spec.listed).collect();
     let content = html! {
         main class="container" {
             section class="hero" {
@@ -1896,19 +2433,21 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
                 }
             }
 
-            @if state.specs.is_empty() {
+            @if listed_specs.is_empty() {
                 p class="empty-state" { "No specification documents found." }
             } @else {
                 ul class="spec-list" {
-                    @for spec in &state.specs {
+                    @for spec in &listed_specs {
+                        @let base_id = spec.revision_of.as_deref().unwrap_or(&spec.id);
+                        @let card_id = format_display_id(&state.display_prefix, base_id);
                         li
                             data-title={(spec.title.to_lowercase())}
-                            data-id={(spec.id.to_lowercase())}
+                            data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
                             a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
                                 div class="spec-meta" {
-                                    span class="spec-id" { "#" (spec.id) }
+                                    span class="spec-id" { "#" (card_id) }
                                 }
                                 div class="spec-title" { (&spec.title) }
                                 div class="spec-meta-details" {
@@ -1946,12 +2485,19 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
 }
 
 fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefix: &str) -> Markup {
-    let display_id = if state.display_prefix.is_empty() {
-        spec.id.clone()
+    let base_id = spec.revision_of.clone().unwrap_or_else(|| spec.id.clone());
+    let display_id = format_display_id(&state.display_prefix, &base_id);
+    let page_id_label = if let Some(pr_number) = spec.pr_number {
+        format!("#{} (PR #{pr_number})", display_id)
     } else {
-        format!("{}{}", state.display_prefix, spec.id)
+        format!("#{display_id}")
     };
-    let title = format!("{display_id} {} - {}", spec.title, state.site_name);
+    let title_id = if let Some(pr_number) = spec.pr_number {
+        format!("{display_id} PR #{pr_number}")
+    } else {
+        display_id.clone()
+    };
+    let title = format!("{title_id} {} - {}", spec.title, state.site_name);
     let description = format!("Rendered specification {}", spec.dir_name);
     let links: Vec<(&str, &str)> = spec
         .links
@@ -1985,6 +2531,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
         })
         .filter(|(_, v, _, _)| !v.is_empty())
         .collect::<Vec<_>>();
+    let revisions = state.revisions.get(&base_id);
 
     let mini_toc_js = state.assets.mini_toc_script();
     let content = html! {
@@ -1996,7 +2543,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                 span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
             }
             div class="spec-header" {
-                div class="spec-id-block" { span class="spec-id" { "#" (spec.id) } }
+                div class="spec-id-block" { span class="spec-id" { (page_id_label) } }
                 div class="spec-title-block" {
                     h1 id="doc-top" { (&spec.title) }
                 }
@@ -2044,6 +2591,23 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                         div class="meta-value meta-value--markdown" { (PreEscaped(value)) }
                     } @else {
                         span class="meta-value" { (value) }
+                    }
+                }
+            }
+
+            @if let Some(items) = revisions {
+                @if !items.is_empty() {
+                    div class="spec-header" {
+                        span class="meta-label" { "REVISIONS" }
+                        span {
+                            @for (index, revision) in items.iter().enumerate() {
+                                @if index > 0 { span class="meta-divider" { "•" } }
+                                a class="spec-metadata-link" href={(join_prefix(prefix, revision.href.trim_start_matches('/')))} {
+                                    (format!("PR #{}", revision.pr_number))
+                                }
+                                span class={(format!("tag {}", revision.status.to_lowercase()))} { (&revision.status) }
+                            }
+                        }
                     }
                 }
             }
@@ -2165,6 +2729,14 @@ fn join_prefix(prefix: &str, path: impl AsRef<str>) -> String {
     }
 }
 
+fn format_display_id(prefix: &str, base_id: &str) -> String {
+    if prefix.is_empty() {
+        base_id.to_string()
+    } else {
+        format!("{prefix}{base_id}")
+    }
+}
+
 struct LayoutAssets<'a> {
     css: &'a str,
     theme_init_js: &'a str,
@@ -2277,6 +2849,9 @@ fn spec_from_generated(spec: GeneratedSpec) -> Result<SpecDocument> {
         extra: spec.extra,
         source,
         format,
+        listed: true,
+        revision_of: None,
+        pr_number: None,
     })
 }
 
@@ -2831,7 +3406,13 @@ fn display_name_from_dir(dir_name: &str) -> String {
         static ref NAME_PREFIX_RE: Regex = Regex::new(r"^\d{4,}-").unwrap();
     }
 
-    let cleaned = NAME_PREFIX_RE.replace(dir_name, "").to_string();
+    let cleaned = NAME_PREFIX_RE
+        .replace(dir_name, "")
+        .trim_end_matches(".md")
+        .trim_end_matches(".markdown")
+        .trim_end_matches(".adoc")
+        .trim_end_matches(".asciidoc")
+        .to_string();
     if cleaned.is_empty() {
         dir_name.to_string()
     } else {

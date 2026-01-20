@@ -29,6 +29,7 @@ thiserror = "1"
 unicode-normalization = "0.1"
 toml = "0.8"
 git2 = { version = "0.18", features = ["vendored-libgit2"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 criterion = "0.5"
