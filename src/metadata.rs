@@ -559,8 +559,7 @@ impl ProjectConfiguration {
             .filter(|s| !s.is_empty());
 
         let pr_number_as_spec_id = value
-            .get("prNumberAsSpecId")
-            .or_else(|| value.get("pr_number_as_spec_id"))
+            .get("pr_number_as_spec_id")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
 
