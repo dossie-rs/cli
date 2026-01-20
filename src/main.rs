@@ -2439,7 +2439,6 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
                 ul class="spec-list" {
                     @for spec in &listed_specs {
                         @let base_id = spec.revision_of.as_deref().unwrap_or(&spec.id);
-                        @let card_id = format_display_id(&state.display_prefix, base_id);
                         li
                             data-title={(spec.title.to_lowercase())}
                             data-id={(base_id.to_lowercase())}
@@ -2447,7 +2446,7 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
                         {
                             a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
                                 div class="spec-meta" {
-                                    span class="spec-id" { "#" (card_id) }
+                                    span class="spec-id" { "#" (base_id) }
                                 }
                                 div class="spec-title" { (&spec.title) }
                                 div class="spec-meta-details" {
@@ -2488,9 +2487,9 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     let base_id = spec.revision_of.clone().unwrap_or_else(|| spec.id.clone());
     let display_id = format_display_id(&state.display_prefix, &base_id);
     let page_id_label = if let Some(pr_number) = spec.pr_number {
-        format!("#{} (PR #{pr_number})", display_id)
+        format!("#{} (PR #{pr_number})", base_id)
     } else {
-        format!("#{display_id}")
+        format!("#{base_id}")
     };
     let title_id = if let Some(pr_number) = spec.pr_number {
         format!("{display_id} PR #{pr_number}")
