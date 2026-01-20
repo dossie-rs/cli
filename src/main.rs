@@ -1821,8 +1821,8 @@ fn map_pull_to_specs(
             current_id.clone()
         };
 
-        let target_dir = spec_dir_for_relative_path(&relative_path, &current_id)
-            .unwrap_or_else(|| PathBuf::new());
+        let target_dir =
+            spec_dir_for_relative_path(&relative_path, &current_id).unwrap_or_default();
         let primary = relative_path.clone();
 
         if seen_ids.insert(target_id.clone()) {
@@ -1851,6 +1851,7 @@ fn map_pull_to_specs(
     Some(targets)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pr_spec_version(
     state: &mut AppState,
     static_mounts: &mut Vec<StaticMount>,
@@ -2079,9 +2080,9 @@ fn spec_id_from_repo_path(path: &Path, spec_root_relative: &Path) -> Option<(Str
 
 fn spec_dir_for_relative_path(path: &Path, spec_id: &str) -> Option<PathBuf> {
     let mut accum = PathBuf::new();
-    let mut components = path.components().peekable();
+    let components = path.components().peekable();
 
-    while let Some(component) = components.next() {
+    for component in components {
         let Component::Normal(os) = component else {
             continue;
         };
@@ -2111,7 +2112,7 @@ fn relative_to_spec_root(path: &Path, spec_root_relative: &Path) -> Option<PathB
         }
     }
 
-    if let Some(last) = spec_root_relative.components().last() {
+    if let Some(last) = spec_root_relative.components().next_back() {
         let tail = PathBuf::from(last.as_os_str());
         if path.starts_with(&tail) {
             if let Ok(stripped) = path.strip_prefix(&tail) {
