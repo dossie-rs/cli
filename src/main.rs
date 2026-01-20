@@ -1236,20 +1236,14 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
 
     match command.as_str() {
         "serve" => {
-            let path = args
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing path for serve"))?;
+            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
             if args.next().is_some() {
                 bail!("Unexpected argument for serve");
             }
             Ok(CliCommand::Serve(validate_path(path)?))
         }
         "prepare" => {
-            let path = args
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing path for prepare"))?;
+            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
             if args.next().is_some() {
                 bail!("Unexpected argument for prepare");
             }
@@ -1276,9 +1270,7 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
                 }
             }
 
-            let input = input_path
-                .ok_or_else(|| anyhow::anyhow!("Missing path for build"))
-                .and_then(validate_path)?;
+            let input = validate_path(input_path.unwrap_or_else(|| ".".to_string()))?;
             let output = output_dir.unwrap_or_else(|| PathBuf::from("output"));
             Ok(CliCommand::Build {
                 input_path: input,
@@ -1286,20 +1278,14 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
             })
         }
         "list" => {
-            let path = args
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing path for list"))?;
+            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
             if args.next().is_some() {
                 bail!("Unexpected argument for list");
             }
             Ok(CliCommand::List(validate_path(path)?))
         }
         "check" => {
-            let path = args
-                .next()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing path for check"))?;
+            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
             if args.next().is_some() {
                 bail!("Unexpected argument for check");
             }
@@ -1311,15 +1297,11 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!(
-        "  dossiers [-c <config-file>] serve <path-to-spec-data.json|path-to-spec-directory>"
-    );
-    eprintln!(
-        "  dossiers [-c <config-file>] prepare <path-to-spec-directory|path-to-spec-data.json>"
-    );
-    eprintln!("  dossiers [-c <config-file>] build <path-to-spec-directory|path-to-spec-data.json> [-o <output-dir>]");
-    eprintln!("  dossiers [-c <config-file>] list <path-to-spec-directory|path-to-spec-data.json>");
-    eprintln!("  dossiers [-c <config-file>] check <path-to-spec-directory>");
+    eprintln!("  dossiers [-c <config-file>] serve [<path-to-spec-directory>]");
+    eprintln!("  dossiers [-c <config-file>] prepare [<path-to-spec-directory>]");
+    eprintln!("  dossiers [-c <config-file>] build [<path-to-spec-directory>] [-o <output-dir>]");
+    eprintln!("  dossiers [-c <config-file>] list [<path-to-spec-directory>]");
+    eprintln!("  dossiers [-c <config-file>] check [<path-to-spec-directory>]");
 }
 
 fn validate_path(path: String) -> Result<PathBuf> {
