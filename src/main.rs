@@ -352,6 +352,7 @@ struct AppState {
     display_prefix: String,
     site_name: String,
     site_description: String,
+    github_repo: Option<String>,
     extra_fields: Vec<ExtraMetadataField>,
     generated_at: i64,
     assets: Assets,
@@ -1662,6 +1663,10 @@ fn augment_with_pull_requests(
         eprintln!("Skipping PR revisions: no GitHub repository found in config or git remotes.");
         return Ok(());
     };
+    let repo_slug = format!("{}/{}", github_repo.owner, github_repo.name);
+    if state.github_repo.is_none() {
+        state.github_repo = Some(repo_slug.clone());
+    }
     eprintln!(
         "Using GitHub repository {}/{} for PR revisions.",
         github_repo.owner, github_repo.name
@@ -2135,6 +2140,11 @@ fn build_app_state(
         .cloned()
         .map(|spec| (spec.id.clone(), spec))
         .collect::<HashMap<_, _>>();
+    let github_repo = project_config
+        .repository
+        .as_deref()
+        .and_then(parse_github_repo)
+        .map(|repo| format!("{}/{}", repo.owner, repo.name));
 
     let state = AppState {
         specs,
@@ -2144,6 +2154,7 @@ fn build_app_state(
         display_prefix: project_config.prefix.clone().unwrap_or_default(),
         site_name,
         site_description: project_config.description.unwrap_or_default(),
+        github_repo,
         extra_fields: project_config.extra_metadata_fields.clone(),
         generated_at,
         assets,
@@ -2482,11 +2493,7 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
 fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefix: &str) -> Markup {
     let base_id = spec.revision_of.clone().unwrap_or_else(|| spec.id.clone());
     let display_id = format_display_id(&state.display_prefix, &base_id);
-    let page_id_label = if let Some(pr_number) = spec.pr_number {
-        format!("#{} (PR #{pr_number})", base_id)
-    } else {
-        format!("#{base_id}")
-    };
+    let page_id_label = format!("#{base_id}");
     let title_id = if let Some(pr_number) = spec.pr_number {
         format!("{display_id} PR #{pr_number}")
     } else {
@@ -2494,6 +2501,13 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     };
     let title = format!("{title_id} {} - {}", spec.title, state.site_name);
     let description = format!("Rendered specification {}", spec.dir_name);
+    let pr_review = match (spec.pr_number, state.github_repo.as_deref()) {
+        (Some(pr_number), Some(repo_slug)) => Some((
+            format!("{repo_slug}#{pr_number}"),
+            format!("https://github.com/{repo_slug}/pull/{pr_number}"),
+        )),
+        _ => None,
+    };
     let links: Vec<(&str, &str)> = spec
         .links
         .iter()
@@ -2536,6 +2550,13 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
             div class="spec-header" {
                 span class="meta-label" { "" }
                 span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
+                @if let Some((pr_text, pr_href)) = pr_review.as_ref() {
+                    span { "—" }
+                    span {
+                       "Review here: "
+                       a class="spec-metadata-link" href=(pr_href) target="_blank" rel="noreferrer noopener" { (pr_text) }
+                    }
+                }
             }
             div class="spec-header" {
                 div class="spec-id-block" { span class="spec-id" { (page_id_label) } }
