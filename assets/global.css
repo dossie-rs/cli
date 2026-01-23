@@ -500,13 +500,13 @@ main {
   padding: 0.5rem 0.65rem;
 }
 
-.doc-content code {
+.doc-content :not(pre) > code {
   background: rgba(255, 255, 255, 0.04);
   padding: 0.15rem 0.35rem;
   border-radius: 6px;
 }
 
-:root[data-theme='light'] .doc-content code {
+:root[data-theme='light'] .doc-content :not(pre) > code {
   background: rgba(15, 23, 42, 0.05);
 }
 
@@ -516,6 +516,13 @@ main {
   padding: 1rem;
   overflow-x: auto;
   border: 1px solid var(--border);
+}
+
+.doc-content pre code {
+  background: inherit;
+  padding: 0;
+  border-radius: 0;
+  display: block;
 }
 
 :root[data-theme='light'] .doc-content pre {
