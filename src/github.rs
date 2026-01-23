@@ -188,9 +188,7 @@ pub fn parse_github_repo(raw: &str) -> Option<GithubRepo> {
         stripped
     } else if let Some(stripped) = cleaned.strip_prefix("git://github.com/") {
         stripped
-    } else if let Some(stripped) = cleaned.strip_prefix("https://github.com/") {
-        stripped
-    } else if let Some(stripped) = cleaned.strip_prefix("http://github.com/") {
+    } else if let Some(stripped) = parse_http_github_repo(cleaned) {
         stripped
     } else if cleaned.contains('/') && !cleaned.contains(':') {
         cleaned
@@ -209,6 +207,24 @@ pub fn parse_github_repo(raw: &str) -> Option<GithubRepo> {
         owner: owner.to_string(),
         name: name.to_string(),
     })
+}
+
+fn parse_http_github_repo(cleaned: &str) -> Option<&str> {
+    let rest = cleaned
+        .strip_prefix("https://")
+        .or_else(|| cleaned.strip_prefix("http://"))?;
+    let slash = rest.find('/')?;
+    let (authority, path) = rest.split_at(slash);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host != "github.com" {
+        return None;
+    }
+    let path = &path[1..];
+    if path.is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(response: Response) -> Result<T> {
