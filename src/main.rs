@@ -1184,7 +1184,7 @@ fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
 
     let command = args.next()?;
 
-    match command.as_str() {
+    let raw_path = match command.as_str() {
         "serve" | "prepare" => args.next().map(PathBuf::from),
         "build" => {
             let mut input_path = None;
@@ -1203,7 +1203,21 @@ fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
             input_path
         }
         _ => None,
-    }
+    }?;
+
+    Some(absolutize_project_dir(raw_path))
+}
+
+fn absolutize_project_dir(path: PathBuf) -> PathBuf {
+    let path = if path.is_absolute() {
+        path
+    } else if let Ok(cwd) = env::current_dir() {
+        cwd.join(path)
+    } else {
+        path
+    };
+
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand)> {
