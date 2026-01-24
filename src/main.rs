@@ -55,10 +55,14 @@ const INDEX_SEARCH_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/index-search.js"
 ));
-const MERMAID_SCRIPT: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mermaid.min.js"));
-const MERMAID_INIT_SCRIPT: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mermaid-init.js"));
+const MERMAID_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/mermaid.min.js"
+));
+const MERMAID_INIT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/mermaid-init.js"
+));
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -375,7 +379,11 @@ impl Assets {
     }
 
     fn mermaid_init_script(&self) -> String {
-        Self::read_script(&self.mermaid_init_source, MERMAID_INIT_SCRIPT, "mermaid init")
+        Self::read_script(
+            &self.mermaid_init_source,
+            MERMAID_INIT_SCRIPT,
+            "mermaid init",
+        )
     }
 }
 
@@ -2377,7 +2385,6 @@ async fn mermaid_script(state: web::Data<ReloadableAppState>) -> impl Responder 
         .body(mermaid_js)
 }
 
-
 async fn index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
     match state.load() {
         Ok(loaded) => {
@@ -3418,11 +3425,13 @@ enum SpecialCodeBlock {
 }
 
 fn render_svgbob_svg(source: &str) -> String {
-    let mut settings = svgbob::Settings::default();
-    settings.background = "var(--svgbob-background, transparent)".to_string();
-    settings.stroke_color = "var(--svgbob-stroke, var(--text))".to_string();
-    settings.fill_color = "var(--svgbob-fill, var(--text))".to_string();
-    settings.include_backdrop = false;
+    let settings = svgbob::Settings {
+        background: "var(--svgbob-background, transparent)".to_string(),
+        stroke_color: "var(--svgbob-stroke, var(--text))".to_string(),
+        fill_color: "var(--svgbob-fill, var(--text))".to_string(),
+        include_backdrop: false,
+        ..Default::default()
+    };
     svgbob::to_svg_with_settings(source, &settings)
 }
 
@@ -3460,21 +3469,19 @@ fn render_markdown(source: &str) -> String {
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
             }
         }
-        Event::End(TagEnd::CodeBlock) => {
-            match special_block.get() {
-                Some(SpecialCodeBlock::Mermaid) => {
-                    special_block.set(None);
-                    Event::Html("</pre>".into())
-                }
-                Some(SpecialCodeBlock::Svgbob) => {
-                    special_block.set(None);
-                    let source = svgbob_buffer.borrow().clone();
-                    let svg = render_svgbob_svg(&source);
-                    Event::Html(format!("<div class=\"svgbob\">{svg}</div>").into())
-                }
-                None => Event::End(TagEnd::CodeBlock),
+        Event::End(TagEnd::CodeBlock) => match special_block.get() {
+            Some(SpecialCodeBlock::Mermaid) => {
+                special_block.set(None);
+                Event::Html("</pre>".into())
             }
-        }
+            Some(SpecialCodeBlock::Svgbob) => {
+                special_block.set(None);
+                let source = svgbob_buffer.borrow().clone();
+                let svg = render_svgbob_svg(&source);
+                Event::Html(format!("<div class=\"svgbob\">{svg}</div>").into())
+            }
+            None => Event::End(TagEnd::CodeBlock),
+        },
         Event::Text(text) => match special_block.get() {
             Some(SpecialCodeBlock::Svgbob) => {
                 svgbob_buffer.borrow_mut().push_str(&text);
