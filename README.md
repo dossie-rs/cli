@@ -21,5 +21,22 @@ Typical use cases:
 - Publish specs, process docs, or policies from a Git repository
 - Integrate documentation builds into CI pipelines
 
+## Diagram support
+
+Markdown fences using `mermaid` (and AsciiDoc source blocks such as
+`[source,mermaid]`) are rendered client-side with Mermaid.js. ASCII diagrams
+using `svgbob` (for example ` ```svgbob ` in Markdown or `[source,svgbob]` in
+AsciiDoc) are rendered server-side into SVG during spec processing.
+
+To update the Mermaid runtime:
+
+```sh
+./scripts/update-mermaid.sh <version>
+```
+
+This refreshes `assets/mermaid.min.js` and records the version in
+`assets/mermaid.version`.
+
+
 For more information, visit the Dossiers website at
 https://dossie.rs

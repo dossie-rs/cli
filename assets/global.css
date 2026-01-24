@@ -10,6 +10,9 @@
   --shadow: rgba(0, 0, 0, 0.18);
   --accent-contrast: #0f172a;
   --input: #1e293b;
+  --svgbob-stroke: var(--text);
+  --svgbob-fill: var(--text);
+  --svgbob-background: transparent;
 }
 
 :root[data-theme='light'] {
@@ -528,6 +531,24 @@ main {
 :root[data-theme='light'] .doc-content pre {
   background: #f7f9fb;
   border-color: rgba(0, 0, 0, 0.08);
+}
+
+.doc-content pre.mermaid[data-processed] {
+  background: transparent;
+  border: none;
+  padding: 0.35rem 0;
+  overflow: visible;
+}
+
+.doc-content pre.mermaid[data-processed] svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.doc-content .svgbob svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
 }
 
 .doc-content ul,
