@@ -30,7 +30,9 @@ use maud::{html, Markup, PreEscaped};
 use metadata::{
     ExtraMetadataField, MetadataReader, MetadataValue, MetadataValueType, ProjectConfiguration,
 };
-use pulldown_cmark::{html as md_html, CodeBlockKind, Event, Options as MdOptions, Parser, Tag};
+use pulldown_cmark::{
+    html as md_html, CodeBlockKind, Event, Options as MdOptions, Parser, Tag, TagEnd,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -2711,6 +2713,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     let css = state.assets.css();
     let theme_init_js = state.assets.theme_init_script();
     let theme_toggle_js = state.assets.theme_toggle_script();
+    let mermaid_init_js = mermaid_init_js.as_deref();
     base_layout(
         &state.site_name,
         &state.site_description,
@@ -2720,8 +2723,8 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
             css: &css,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
-            mermaid_js_url: None,
-            mermaid_init_js: None,
+            mermaid_js_url: mermaid_js_url.as_deref(),
+            mermaid_init_js,
         },
         content,
         prefix,
@@ -2774,7 +2777,6 @@ fn render_author(
     let css = state.assets.css();
     let theme_init_js = state.assets.theme_init_script();
     let theme_toggle_js = state.assets.theme_toggle_script();
-    let mermaid_init_js = mermaid_init_js.as_deref();
     base_layout(
         &state.site_name,
         &state.site_description,
@@ -2784,8 +2786,8 @@ fn render_author(
             css: &css,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
-            mermaid_js_url: mermaid_js_url.as_deref(),
-            mermaid_init_js,
+            mermaid_js_url: None,
+            mermaid_init_js: None,
         },
         content,
         prefix,
@@ -3385,12 +3387,12 @@ fn render_markdown(source: &str) -> String {
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
             }
         }
-        Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+        Event::End(TagEnd::CodeBlock) => {
             if in_mermaid.get() {
                 in_mermaid.set(false);
                 Event::Html("</pre>".into())
             } else {
-                Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                Event::End(TagEnd::CodeBlock)
             }
         }
         _ => event,
