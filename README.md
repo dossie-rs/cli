@@ -21,5 +21,20 @@ Typical use cases:
 - Publish specs, process docs, or policies from a Git repository
 - Integrate documentation builds into CI pipelines
 
+## Mermaid diagrams
+
+Markdown fences using `mermaid` (and AsciiDoc source blocks such as
+`[source,mermaid]`) are rendered client-side with Mermaid.js. The runtime is
+vendored locally so it can be hosted alongside the generated site.
+
+To update the Mermaid runtime:
+
+```sh
+./scripts/update-mermaid.sh <version>
+```
+
+This refreshes `assets/mermaid.min.js` and records the version in
+`assets/mermaid.version`.
+
 For more information, visit the Dossiers website at
 https://dossie.rs

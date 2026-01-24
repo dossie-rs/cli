@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write;
@@ -12,6 +13,7 @@ use actix_files::Files;
 use actix_web::{rt::task, web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{anyhow, bail, Context, Result};
 use asciidoc_parser::{
+    attributes::Attrlist,
     blocks::{
         Block as AsciidocBlock, Break as AsciidocBreak, BreakType, CompoundDelimitedBlock,
         IsBlock as _, MediaBlock, MediaType, RawDelimitedBlock, SectionBlock, SimpleBlock,
@@ -28,7 +30,7 @@ use maud::{html, Markup, PreEscaped};
 use metadata::{
     ExtraMetadataField, MetadataReader, MetadataValue, MetadataValueType, ProjectConfiguration,
 };
-use pulldown_cmark::{html as md_html, Options as MdOptions, Parser, Tag};
+use pulldown_cmark::{html as md_html, CodeBlockKind, Event, Options as MdOptions, Parser, Tag};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -51,6 +53,10 @@ const INDEX_SEARCH_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/index-search.js"
 ));
+const MERMAID_SCRIPT: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mermaid.min.js"));
+const MERMAID_INIT_SCRIPT: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mermaid-init.js"));
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +190,8 @@ struct Assets {
     theme_toggle_source: ScriptSource,
     mini_toc_source: ScriptSource,
     index_search_source: ScriptSource,
+    mermaid_source: ScriptSource,
+    mermaid_init_source: ScriptSource,
 }
 
 #[derive(Clone)]
@@ -213,6 +221,8 @@ impl Assets {
             theme_toggle_source: ScriptSource::Embedded(THEME_TOGGLE_SCRIPT),
             mini_toc_source: ScriptSource::Embedded(MINI_TOC_SCRIPT),
             index_search_source: ScriptSource::Embedded(INDEX_SEARCH_SCRIPT),
+            mermaid_source: ScriptSource::Embedded(MERMAID_SCRIPT),
+            mermaid_init_source: ScriptSource::Embedded(MERMAID_INIT_SCRIPT),
         }
     }
 
@@ -223,6 +233,8 @@ impl Assets {
         let theme_toggle_path = dir.join("theme-toggle.js");
         let mini_toc_path = dir.join("mini-toc.js");
         let index_search_path = dir.join("index-search.js");
+        let mermaid_path = dir.join("mermaid.min.js");
+        let mermaid_init_path = dir.join("mermaid-init.js");
 
         let css_source = if css_path.exists() {
             CssSource::File(css_path)
@@ -260,6 +272,18 @@ impl Assets {
             ScriptSource::Embedded(INDEX_SEARCH_SCRIPT)
         };
 
+        let mermaid_source = if mermaid_path.exists() {
+            ScriptSource::File(mermaid_path)
+        } else {
+            ScriptSource::Embedded(MERMAID_SCRIPT)
+        };
+
+        let mermaid_init_source = if mermaid_init_path.exists() {
+            ScriptSource::File(mermaid_init_path)
+        } else {
+            ScriptSource::Embedded(MERMAID_INIT_SCRIPT)
+        };
+
         Self {
             css_source,
             favicon_source,
@@ -267,6 +291,8 @@ impl Assets {
             theme_toggle_source,
             mini_toc_source,
             index_search_source,
+            mermaid_source,
+            mermaid_init_source,
         }
     }
 
@@ -340,6 +366,14 @@ impl Assets {
             INDEX_SEARCH_SCRIPT,
             "index search",
         )
+    }
+
+    fn mermaid_script(&self) -> String {
+        Self::read_script(&self.mermaid_source, MERMAID_SCRIPT, "mermaid runtime")
+    }
+
+    fn mermaid_init_script(&self) -> String {
+        Self::read_script(&self.mermaid_init_source, MERMAID_INIT_SCRIPT, "mermaid init")
     }
 }
 
@@ -1509,6 +1543,7 @@ async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result
             .app_data(web::Data::new(reloadable_state.clone()))
             .route("/", web::get().to(index_page))
             .route("/favicon.svg", web::get().to(favicon))
+            .route("/assets/mermaid.min.js", web::get().to(mermaid_script))
             .route("/author/{slug}/", web::get().to(author_redirect))
             .route("/author/{slug}", web::get().to(author_page))
             .route("/{spec_id:\\d+}", web::get().to(spec_page))
@@ -1588,6 +1623,7 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     let index_html = render_index(&state, "./").into_string();
     write_html_file(&index_path, index_html)?;
     write_embedded_favicon(&output_dir)?;
+    write_mermaid_script(&output_dir, &state.assets.mermaid_script())?;
 
     for spec in &state.specs {
         let rendered_html = render_spec_body(&state, spec, "".to_string(), "../")?;
@@ -2198,6 +2234,19 @@ fn write_embedded_favicon(output_root: &Path) -> Result<()> {
         .with_context(|| format!("Writing favicon to {}", target.display()))
 }
 
+fn write_mermaid_script(output_root: &Path, mermaid_js: &str) -> Result<()> {
+    if mermaid_js.trim().is_empty() {
+        return Ok(());
+    }
+
+    let target = output_root.join("assets").join("mermaid.min.js");
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&target, mermaid_js)
+        .with_context(|| format!("Writing mermaid script to {}", target.display()))
+}
+
 fn collect_doc_assets(html: &str) -> Vec<String> {
     lazy_static! {
         static ref ASSET_RE: Regex =
@@ -2317,6 +2366,13 @@ async fn favicon(state: web::Data<ReloadableAppState>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("image/svg+xml")
         .body(favicon)
+}
+
+async fn mermaid_script(state: web::Data<ReloadableAppState>) -> impl Responder {
+    let mermaid_js = state.assets().mermaid_script();
+    HttpResponse::Ok()
+        .content_type("text/javascript; charset=utf-8")
+        .body(mermaid_js)
 }
 
 async fn index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
@@ -2483,6 +2539,8 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
             css: &css,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
+            mermaid_js_url: None,
+            mermaid_init_js: None,
         },
         content,
         prefix,
@@ -2543,6 +2601,17 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     let revisions = state.revisions.get(&base_id);
 
     let mini_toc_js = state.assets.mini_toc_script();
+    let needs_mermaid = has_mermaid_markup(rendered_html);
+    let mermaid_js_url = if needs_mermaid {
+        Some(join_prefix(prefix, "assets/mermaid.min.js"))
+    } else {
+        None
+    };
+    let mermaid_init_js = if needs_mermaid {
+        Some(state.assets.mermaid_init_script())
+    } else {
+        None
+    };
     let content = html! {
         main class="container" {
             a class="back-link" href={(join_prefix(prefix, ""))} { "← Back to index" }
@@ -2651,6 +2720,8 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
             css: &css,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
+            mermaid_js_url: None,
+            mermaid_init_js: None,
         },
         content,
         prefix,
@@ -2703,6 +2774,7 @@ fn render_author(
     let css = state.assets.css();
     let theme_init_js = state.assets.theme_init_script();
     let theme_toggle_js = state.assets.theme_toggle_script();
+    let mermaid_init_js = mermaid_init_js.as_deref();
     base_layout(
         &state.site_name,
         &state.site_description,
@@ -2712,6 +2784,8 @@ fn render_author(
             css: &css,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
+            mermaid_js_url: mermaid_js_url.as_deref(),
+            mermaid_init_js,
         },
         content,
         prefix,
@@ -2757,6 +2831,8 @@ struct LayoutAssets<'a> {
     css: &'a str,
     theme_init_js: &'a str,
     theme_toggle_js: &'a str,
+    mermaid_js_url: Option<&'a str>,
+    mermaid_init_js: Option<&'a str>,
 }
 
 fn format_generated_at(timestamp: i64) -> String {
@@ -2783,6 +2859,8 @@ fn base_layout(
         css,
         theme_init_js,
         theme_toggle_js,
+        mermaid_js_url,
+        mermaid_init_js,
     } = assets;
     let home_href = join_prefix(prefix, "");
     let favicon_href = join_prefix(prefix, "favicon.svg");
@@ -2827,6 +2905,12 @@ fn base_layout(
                         " v" (version)
                         span class="footer-label" { " • Built " (formatted_generated_at) }
                     }
+                }
+                @if let Some(mermaid_js_url) = mermaid_js_url {
+                    script src=(mermaid_js_url) {}
+                }
+                @if let Some(mermaid_init_js) = mermaid_init_js {
+                    script { (PreEscaped(mermaid_init_js)) }
                 }
                 script { (PreEscaped(theme_toggle_js)) }
             }
@@ -2922,6 +3006,13 @@ fn render_spec_body(
     Ok(rewritten_links)
 }
 
+fn has_mermaid_markup(html: &str) -> bool {
+    html.contains("class=\"mermaid\"")
+        || html.contains("class='mermaid'")
+        || html.contains("language-mermaid")
+        || html.contains("lang-mermaid")
+}
+
 fn render_asciidoc_document(doc: &AsciidocDocument<'_>) -> String {
     let mut html = String::new();
 
@@ -2986,11 +3077,19 @@ fn render_simple_block(block: &SimpleBlock<'_>, buf: &mut String) {
             );
         }
         SimpleBlockStyle::Listing | SimpleBlockStyle::Source => {
-            let _ = write!(
-                buf,
-                "<pre><code>{}</code></pre>",
-                block.content().rendered()
-            );
+            if is_mermaid_attrlist(block.attrlist()) {
+                let _ = write!(
+                    buf,
+                    "<pre class=\"mermaid\">{}</pre>",
+                    block.content().rendered()
+                );
+            } else {
+                let _ = write!(
+                    buf,
+                    "<pre><code>{}</code></pre>",
+                    block.content().rendered()
+                );
+            }
         }
     }
 
@@ -3085,18 +3184,34 @@ fn render_raw_block(block: &RawDelimitedBlock<'_>, buf: &mut String) {
     match context.as_ref() {
         "pass" => buf.push_str(block.content().rendered()),
         "literal" => {
-            let _ = write!(
-                buf,
-                "<pre><code>{}</code></pre>",
-                block.content().rendered()
-            );
+            if is_mermaid_attrlist(block.attrlist()) {
+                let _ = write!(
+                    buf,
+                    "<pre class=\"mermaid\">{}</pre>",
+                    block.content().rendered()
+                );
+            } else {
+                let _ = write!(
+                    buf,
+                    "<pre><code>{}</code></pre>",
+                    block.content().rendered()
+                );
+            }
         }
         "listing" => {
-            let _ = write!(
-                buf,
-                "<pre><code>{}</code></pre>",
-                block.content().rendered()
-            );
+            if is_mermaid_attrlist(block.attrlist()) {
+                let _ = write!(
+                    buf,
+                    "<pre class=\"mermaid\">{}</pre>",
+                    block.content().rendered()
+                );
+            } else {
+                let _ = write!(
+                    buf,
+                    "<pre><code>{}</code></pre>",
+                    block.content().rendered()
+                );
+            }
         }
         _ => buf.push_str(block.content().rendered()),
     }
@@ -3198,6 +3313,49 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn is_mermaid_fence(info: &str) -> bool {
+    let trimmed = info.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let token = trimmed
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
+        .next()
+        .unwrap_or("");
+    token.eq_ignore_ascii_case("mermaid")
+}
+
+fn is_mermaid_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
+    let Some(attrlist) = attrlist else {
+        return false;
+    };
+
+    if let Some(style) = attrlist.block_style() {
+        if style.eq_ignore_ascii_case("mermaid") {
+            return true;
+        }
+        if style.eq_ignore_ascii_case("source") || style.eq_ignore_ascii_case("listing") {
+            if let Some(lang) = attrlist.nth_attribute(2).map(|attr| attr.value()) {
+                if lang.eq_ignore_ascii_case("mermaid") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if let Some(lang) = attrlist
+        .named_attribute("language")
+        .or_else(|| attrlist.named_attribute("source-language"))
+        .map(|attr| attr.value())
+    {
+        if lang.eq_ignore_ascii_case("mermaid") {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn render_plaintext(source: &str) -> String {
     format!("<pre>{}</pre>", escape_html(source))
 }
@@ -3217,6 +3375,26 @@ fn render_markdown(source: &str) -> String {
     options.insert(MdOptions::ENABLE_TABLES);
     options.insert(MdOptions::ENABLE_FOOTNOTES);
     let parser = Parser::new_ext(source, options);
+    let in_mermaid = Cell::new(false);
+    let parser = parser.map(|event| match event {
+        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+            if is_mermaid_fence(&info) {
+                in_mermaid.set(true);
+                Event::Html("<pre class=\"mermaid\">".into())
+            } else {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+            }
+        }
+        Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+            if in_mermaid.get() {
+                in_mermaid.set(false);
+                Event::Html("</pre>".into())
+            } else {
+                Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+            }
+        }
+        _ => event,
+    });
     let mut html = String::new();
     md_html::push_html(&mut html, parser);
     html

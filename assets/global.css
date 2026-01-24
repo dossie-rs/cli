@@ -530,6 +530,18 @@ main {
   border-color: rgba(0, 0, 0, 0.08);
 }
 
+.doc-content pre.mermaid[data-processed] {
+  background: transparent;
+  border: none;
+  padding: 0.35rem 0;
+  overflow: visible;
+}
+
+.doc-content pre.mermaid[data-processed] svg {
+  max-width: 100%;
+  height: auto;
+}
+
 .doc-content ul,
 .doc-content ol {
   padding-left: 1.2rem;
