@@ -10,6 +10,9 @@
   --shadow: rgba(0, 0, 0, 0.18);
   --accent-contrast: #0f172a;
   --input: #1e293b;
+  --svgbob-stroke: var(--text);
+  --svgbob-fill: var(--text);
+  --svgbob-background: transparent;
 }
 
 :root[data-theme='light'] {

@@ -3418,7 +3418,12 @@ enum SpecialCodeBlock {
 }
 
 fn render_svgbob_svg(source: &str) -> String {
-    svgbob::to_svg(source)
+    let mut settings = svgbob::Settings::default();
+    settings.background = "var(--svgbob-background, transparent)".to_string();
+    settings.stroke_color = "var(--svgbob-stroke, var(--text))".to_string();
+    settings.fill_color = "var(--svgbob-fill, var(--text))".to_string();
+    settings.include_backdrop = false;
+    svgbob::to_svg_with_settings(source, &settings)
 }
 
 fn render_plaintext(source: &str) -> String {
