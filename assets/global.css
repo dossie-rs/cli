@@ -542,6 +542,12 @@ main {
   height: auto;
 }
 
+.doc-content .svgbob svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
 .doc-content ul,
 .doc-content ol {
   padding-left: 1.2rem;

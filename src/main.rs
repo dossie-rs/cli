@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write;
@@ -2377,6 +2377,7 @@ async fn mermaid_script(state: web::Data<ReloadableAppState>) -> impl Responder 
         .body(mermaid_js)
 }
 
+
 async fn index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
     match state.load() {
         Ok(loaded) => {
@@ -3085,6 +3086,9 @@ fn render_simple_block(block: &SimpleBlock<'_>, buf: &mut String) {
                     "<pre class=\"mermaid\">{}</pre>",
                     block.content().rendered()
                 );
+            } else if is_svgbob_attrlist(block.attrlist()) {
+                let svg = render_svgbob_svg(block.content().rendered());
+                let _ = write!(buf, "<div class=\"svgbob\">{svg}</div>");
             } else {
                 let _ = write!(
                     buf,
@@ -3192,6 +3196,9 @@ fn render_raw_block(block: &RawDelimitedBlock<'_>, buf: &mut String) {
                     "<pre class=\"mermaid\">{}</pre>",
                     block.content().rendered()
                 );
+            } else if is_svgbob_attrlist(block.attrlist()) {
+                let svg = render_svgbob_svg(block.content().rendered());
+                let _ = write!(buf, "<div class=\"svgbob\">{svg}</div>");
             } else {
                 let _ = write!(
                     buf,
@@ -3207,6 +3214,9 @@ fn render_raw_block(block: &RawDelimitedBlock<'_>, buf: &mut String) {
                     "<pre class=\"mermaid\">{}</pre>",
                     block.content().rendered()
                 );
+            } else if is_svgbob_attrlist(block.attrlist()) {
+                let svg = render_svgbob_svg(block.content().rendered());
+                let _ = write!(buf, "<div class=\"svgbob\">{svg}</div>");
             } else {
                 let _ = write!(
                     buf,
@@ -3327,6 +3337,18 @@ fn is_mermaid_fence(info: &str) -> bool {
     token.eq_ignore_ascii_case("mermaid")
 }
 
+fn is_svgbob_fence(info: &str) -> bool {
+    let trimmed = info.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let token = trimmed
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
+        .next()
+        .unwrap_or("");
+    token.eq_ignore_ascii_case("svgbob")
+}
+
 fn is_mermaid_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
     let Some(attrlist) = attrlist else {
         return false;
@@ -3358,6 +3380,47 @@ fn is_mermaid_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
     false
 }
 
+fn is_svgbob_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
+    let Some(attrlist) = attrlist else {
+        return false;
+    };
+
+    if let Some(style) = attrlist.block_style() {
+        if style.eq_ignore_ascii_case("svgbob") {
+            return true;
+        }
+        if style.eq_ignore_ascii_case("source") || style.eq_ignore_ascii_case("listing") {
+            if let Some(lang) = attrlist.nth_attribute(2).map(|attr| attr.value()) {
+                if lang.eq_ignore_ascii_case("svgbob") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if let Some(lang) = attrlist
+        .named_attribute("language")
+        .or_else(|| attrlist.named_attribute("source-language"))
+        .map(|attr| attr.value())
+    {
+        if lang.eq_ignore_ascii_case("svgbob") {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Clone, Copy)]
+enum SpecialCodeBlock {
+    Mermaid,
+    Svgbob,
+}
+
+fn render_svgbob_svg(source: &str) -> String {
+    svgbob::to_svg(source)
+}
+
 fn render_plaintext(source: &str) -> String {
     format!("<pre>{}</pre>", escape_html(source))
 }
@@ -3377,24 +3440,50 @@ fn render_markdown(source: &str) -> String {
     options.insert(MdOptions::ENABLE_TABLES);
     options.insert(MdOptions::ENABLE_FOOTNOTES);
     let parser = Parser::new_ext(source, options);
-    let in_mermaid = Cell::new(false);
+    let special_block = Cell::new(None);
+    let svgbob_buffer = RefCell::new(String::new());
     let parser = parser.map(|event| match event {
         Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
             if is_mermaid_fence(&info) {
-                in_mermaid.set(true);
+                special_block.set(Some(SpecialCodeBlock::Mermaid));
                 Event::Html("<pre class=\"mermaid\">".into())
+            } else if is_svgbob_fence(&info) {
+                special_block.set(Some(SpecialCodeBlock::Svgbob));
+                svgbob_buffer.borrow_mut().clear();
+                Event::Html("".into())
             } else {
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
             }
         }
         Event::End(TagEnd::CodeBlock) => {
-            if in_mermaid.get() {
-                in_mermaid.set(false);
-                Event::Html("</pre>".into())
-            } else {
-                Event::End(TagEnd::CodeBlock)
+            match special_block.get() {
+                Some(SpecialCodeBlock::Mermaid) => {
+                    special_block.set(None);
+                    Event::Html("</pre>".into())
+                }
+                Some(SpecialCodeBlock::Svgbob) => {
+                    special_block.set(None);
+                    let source = svgbob_buffer.borrow().clone();
+                    let svg = render_svgbob_svg(&source);
+                    Event::Html(format!("<div class=\"svgbob\">{svg}</div>").into())
+                }
+                None => Event::End(TagEnd::CodeBlock),
             }
         }
+        Event::Text(text) => match special_block.get() {
+            Some(SpecialCodeBlock::Svgbob) => {
+                svgbob_buffer.borrow_mut().push_str(&text);
+                Event::Html("".into())
+            }
+            _ => Event::Text(text),
+        },
+        Event::SoftBreak | Event::HardBreak => match special_block.get() {
+            Some(SpecialCodeBlock::Svgbob) => {
+                svgbob_buffer.borrow_mut().push('\n');
+                Event::Html("".into())
+            }
+            _ => event,
+        },
         _ => event,
     });
     let mut html = String::new();
