@@ -1,7 +1,7 @@
 [package]
 name = "dossiers"
 description = "Dossiers: A home for your specs, policies, and process docs"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 autobins = false
 homepage = "https://dossie.rs"
