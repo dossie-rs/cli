@@ -307,6 +307,7 @@ main {
 
 .meta-divider {
   color: var(--muted);
+  margin: 0 0.4rem;
 }
 
 .spec-author-link,
