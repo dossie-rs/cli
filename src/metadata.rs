@@ -51,6 +51,9 @@ pub struct ProjectConfiguration {
     #[allow(dead_code)]
     pub field_aliases: HashMap<String, String>,
     pub empty_values: Vec<String>,
+    pub default_branch: Option<String>,
+    pub new_document_format: Option<String>,
+    pub new_document_structure: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +663,27 @@ impl ProjectConfiguration {
             })
             .unwrap_or_else(|| vec!["n/a".to_string()]);
 
+        let default_branch = value
+            .get("default_branch")
+            .or_else(|| value.get("defaultBranch"))
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let new_document_format = value
+            .get("new_document_format")
+            .or_else(|| value.get("newDocumentFormat"))
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s == "markdown" || s == "asciidoc");
+
+        let new_document_structure = value
+            .get("new_document_structure")
+            .or_else(|| value.get("newDocumentStructure"))
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| s == "directory" || s == "flat");
+
         Self {
             name,
             title,
@@ -677,6 +701,9 @@ impl ProjectConfiguration {
             extra_metadata_fields,
             field_aliases,
             empty_values,
+            default_branch,
+            new_document_format,
+            new_document_structure,
         }
     }
 }

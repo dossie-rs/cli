@@ -63,6 +63,10 @@ const MERMAID_INIT_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/mermaid-init.js"
 ));
+const CREATE_MODAL_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/create-modal.js"
+));
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -408,6 +412,17 @@ struct AppState {
     generated_at: i64,
     assets: Assets,
     renderer: DocRenderer,
+    create_config: Option<CreateDocConfig>,
+}
+
+#[derive(Clone)]
+struct CreateDocConfig {
+    github_repo: String,
+    default_branch: String,
+    subdirectory: Option<String>,
+    next_id: u64,
+    format: String,    // "md" or "adoc"
+    structure: String, // "directory" or "flat"
 }
 
 type StaticMount = (String, PathBuf);
@@ -440,6 +455,7 @@ impl ReloadableAppState {
         let site_name = resolve_site_name(&self.project_root, &project_config);
         build_app_state(
             &self.input_path,
+            &self.project_root,
             site_name,
             self.assets.clone(),
             project_config,
@@ -1145,8 +1161,8 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             task::spawn_blocking(move || {
                 run_build(input_path, output_dir, config_path, trailing_slashes)
             })
-                .await
-                .map_err(|err| anyhow!("build task failed: {err}"))??;
+            .await
+            .map_err(|err| anyhow!("build task failed: {err}"))??;
             Ok(())
         }
         CliCommand::Check(input_path) => run_check(input_path, config_path),
@@ -1557,8 +1573,13 @@ async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result
     let assets = Assets::from_assets_dir(project_root.join("assets"));
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (_initial_state, static_mounts) =
-        build_app_state(&input_path, site_name, assets.clone(), project_config)?;
+    let (_initial_state, static_mounts) = build_app_state(
+        &input_path,
+        &project_root,
+        site_name,
+        assets.clone(),
+        project_config,
+    )?;
     let reloadable_state = ReloadableAppState {
         input_path: input_path.clone(),
         project_root: project_root.clone(),
@@ -1629,8 +1650,13 @@ fn run_build(
     let assets = Assets::embedded();
     let site_name = resolve_site_name(&project_root, &project_config);
 
-    let (mut state, mut static_mounts) =
-        build_app_state(&input_path, site_name, assets, project_config.clone())?;
+    let (mut state, mut static_mounts) = build_app_state(
+        &input_path,
+        &project_root,
+        site_name,
+        assets,
+        project_config.clone(),
+    )?;
 
     if let Err(err) = augment_with_pull_requests(
         &mut state,
@@ -1670,8 +1696,7 @@ fn run_build(
         } else {
             join_prefix(&prefix, format!("{}/", spec.id))
         };
-        let rendered_html =
-            render_spec_body(&state, spec, asset_base, &prefix, trailing_slashes)?;
+        let rendered_html = render_spec_body(&state, spec, asset_base, &prefix, trailing_slashes)?;
         let page =
             render_spec(&state, spec, &rendered_html, &prefix, trailing_slashes).into_string();
         let dest = output_dir.join(&spec.id).join("index.html");
@@ -1711,9 +1736,8 @@ fn run_build(
             .iter()
             .filter(|spec| spec.listed && slugify_status(&spec.status) == summary_slug)
             .collect();
-        let page =
-            render_status(&state, &summary.name, &matching, "../../", trailing_slashes)
-                .into_string();
+        let page = render_status(&state, &summary.name, &matching, "../../", trailing_slashes)
+            .into_string();
         let dest = output_dir
             .join("status")
             .join(&summary.slug)
@@ -2236,6 +2260,7 @@ fn relative_to_spec_root(path: &Path, spec_root_relative: &Path) -> Option<PathB
 
 fn build_app_state(
     input_path: &Path,
+    project_root: &Path,
     site_name: String,
     assets: Assets,
     project_config: ProjectConfiguration,
@@ -2249,11 +2274,80 @@ fn build_app_state(
         .cloned()
         .map(|spec| (spec.id.clone(), spec))
         .collect::<HashMap<_, _>>();
-    let github_repo = project_config
+
+    // Try config first, then fall back to git remote
+    let repo_from_config = project_config
         .repository
         .as_deref()
-        .and_then(parse_github_repo)
+        .and_then(parse_github_repo);
+    let git_repo = open_git_repository(project_root);
+    let repo_from_git = git_repo
+        .as_ref()
+        .and_then(|repo| repo.remote_url())
+        .as_deref()
+        .and_then(parse_github_repo);
+    let github_repo = repo_from_config
+        .or(repo_from_git)
         .map(|repo| format!("{}/{}", repo.owner, repo.name));
+
+    // Compute create config if GitHub repo is available
+    let spec_root = resolve_spec_input_path(input_path, &project_config);
+    let create_config = github_repo.as_ref().map(|repo| {
+        // Find the next available spec ID by parsing existing IDs as numbers
+        let next_id = spec_ids
+            .iter()
+            .filter_map(|id| id.parse::<u64>().ok())
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(1);
+
+        // Infer format from existing specs (majority wins), or use config, or default to markdown
+        let format = project_config
+            .new_document_format
+            .as_deref()
+            .map(|f| if f == "asciidoc" { "adoc" } else { "md" })
+            .unwrap_or_else(|| {
+                let asciidoc_count = specs
+                    .iter()
+                    .filter(|s| matches!(s.format, DocFormat::Asciidoc))
+                    .count();
+                let markdown_count = specs.len().saturating_sub(asciidoc_count);
+                if asciidoc_count > markdown_count {
+                    "adoc"
+                } else {
+                    "md"
+                }
+            })
+            .to_string();
+
+        // Infer structure from existing specs (check if dir_name corresponds to a directory)
+        let structure = project_config
+            .new_document_structure
+            .clone()
+            .unwrap_or_else(|| {
+                let dir_count = specs
+                    .iter()
+                    .filter(|s| spec_root.join(&s.dir_name).is_dir())
+                    .count();
+                if dir_count > specs.len() / 2 {
+                    "directory".to_string()
+                } else {
+                    "flat".to_string()
+                }
+            });
+
+        CreateDocConfig {
+            github_repo: repo.clone(),
+            default_branch: project_config
+                .default_branch
+                .clone()
+                .unwrap_or_else(|| "main".to_string()),
+            subdirectory: project_config.subdirectory.clone(),
+            next_id,
+            format,
+            structure,
+        }
+    });
 
     let state = AppState {
         specs,
@@ -2268,6 +2362,7 @@ fn build_app_state(
         generated_at,
         assets,
         renderer,
+        create_config,
     };
 
     Ok((state, static_mounts))
@@ -2322,8 +2417,7 @@ fn write_mermaid_script(output_root: &Path, mermaid_js: &str) -> Result<()> {
 
 fn collect_doc_assets(html: &str, spec_id: Option<&str>) -> Vec<String> {
     lazy_static! {
-        static ref ASSET_RE: Regex =
-            Regex::new(r#"(?i)\b(?:src|href)=['"]([^'">]+)['"]"#).unwrap();
+        static ref ASSET_RE: Regex = Regex::new(r#"(?i)\b(?:src|href)=['"]([^'">]+)['"]"#).unwrap();
     }
 
     ASSET_RE
@@ -2337,11 +2431,7 @@ fn collect_doc_assets(html: &str, spec_id: Option<&str>) -> Vec<String> {
 }
 
 fn normalize_asset_path(raw: &str, spec_id: Option<&str>) -> String {
-    if raw.is_empty()
-        || raw.starts_with('#')
-        || raw.starts_with('/')
-        || raw.starts_with("//")
-    {
+    if raw.is_empty() || raw.starts_with('#') || raw.starts_with('/') || raw.starts_with("//") {
         return String::new();
     }
 
@@ -2509,13 +2599,8 @@ async fn spec_page(
             .finish();
     };
 
-    let rendered_html = match render_spec_body(
-        &loaded,
-        spec,
-        format!("/{}/", spec.id),
-        "/",
-        false,
-    ) {
+    let rendered_html = match render_spec_body(&loaded, spec, format!("/{}/", spec.id), "/", false)
+    {
         Ok(html) => html,
         Err(err) => {
             eprintln!("Failed to render spec {spec_id}: {err:?}");
@@ -2633,10 +2718,23 @@ fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Marku
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
     let listed_specs: Vec<&SpecDocument> = state.specs.iter().filter(|spec| spec.listed).collect();
+    let create_config = &state.create_config;
     let content = html! {
         main class="container" {
             section class="hero" {
-                h1 { "Specification Library" }
+                div class="hero-header" {
+                    h1 { "Specification Library" }
+                    @if let Some(config) = create_config {
+                        button type="button" class="create-btn" onclick="openCreateModal()" { "+ Create..." }
+                        // Hidden data for JS
+                        input type="hidden" id="create-github-repo" value=(config.github_repo) {}
+                        input type="hidden" id="create-branch" value=(config.default_branch) {}
+                        input type="hidden" id="create-subdir" value=(config.subdirectory.as_deref().unwrap_or("")) {}
+                        input type="hidden" id="create-next-id" value=(format!("{:04}", config.next_id)) {}
+                        input type="hidden" id="create-format" value=(config.format) {}
+                        input type="hidden" id="create-structure" value=(config.structure) {}
+                    }
+                }
                 p { "Browse all specifications documents. Search by title, ID, or author to jump straight to what you need." }
                 form class="search-bar" role="search" onsubmit="event.preventDefault();" {
                     label class="sr-only" for="spec-search" { "Search specifications" }
@@ -2674,8 +2772,33 @@ fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Marku
                 }
                 p class="empty-state filter-empty" hidden { "No specs match this search." }
             }
+
+            // Create document modal
+            @if create_config.is_some() {
+                div id="create-modal" class="modal" hidden {
+                    div class="modal-backdrop" onclick="closeCreateModal()" {}
+                    div class="modal-content" {
+                        h2 { "Create New Specification" }
+                        form id="create-form" onsubmit="handleCreateSubmit(event)" {
+                            label for="create-title" { "Document Title" }
+                            input type="text" id="create-title" name="title" placeholder="My New Specification" required autofocus {}
+                            p class="create-preview" {
+                                "Path: "
+                                code id="create-path-preview" { "..." }
+                            }
+                            div class="modal-actions" {
+                                button type="button" class="btn-secondary" onclick="closeCreateModal()" { "Cancel" }
+                                button type="submit" class="btn-primary" { "Create on GitHub" }
+                            }
+                        }
+                    }
+                }
+            }
             }
         script { (PreEscaped(index_search_js)) }
+        @if create_config.is_some() {
+            script { (PreEscaped(CREATE_MODAL_JS)) }
+        }
     };
 
     let css = state.assets.css();
@@ -3357,8 +3480,12 @@ fn render_spec_body(
     };
     let without_heading = remove_leading_heading(&rendered);
     let prefixed_assets = prefix_asset_urls(&without_heading, &asset_base);
-    let rewritten_links =
-        rewrite_spec_links(&prefixed_assets, &state.spec_ids, link_prefix, trailing_slashes);
+    let rewritten_links = rewrite_spec_links(
+        &prefixed_assets,
+        &state.spec_ids,
+        link_prefix,
+        trailing_slashes,
+    );
     Ok(rewritten_links)
 }
 
@@ -3877,7 +4004,11 @@ fn prefix_asset_urls(html: &str, asset_base: &str) -> String {
         .replace_all(html, |caps: &regex::Captures| {
             let original = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
             let attr = &caps[1];
-            let value = caps.get(3).or_else(|| caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+            let value = caps
+                .get(3)
+                .or_else(|| caps.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or("");
             let quote = if caps.get(3).is_some() { "\"" } else { "'" };
             let attr_lower = attr.to_ascii_lowercase();
             if value.is_empty()
@@ -3906,13 +4037,16 @@ fn rewrite_spec_links(
     trailing_slashes: bool,
 ) -> String {
     lazy_static! {
-        static ref HREF_RE: Regex =
-            Regex::new(r#"(?i)\bhref=(\"([^\"]+)\"|'([^']+)')"#).unwrap();
+        static ref HREF_RE: Regex = Regex::new(r#"(?i)\bhref=(\"([^\"]+)\"|'([^']+)')"#).unwrap();
     }
 
     HREF_RE
         .replace_all(html, |caps: &regex::Captures| {
-            let url = caps.get(2).or_else(|| caps.get(3)).map(|m| m.as_str()).unwrap_or("");
+            let url = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("");
             let quote = if caps.get(2).is_some() { "\"" } else { "'" };
             let rewritten = normalize_spec_link(url, spec_ids, prefix, trailing_slashes);
             format!(r#"href={quote}{rewritten}{quote}"#)
