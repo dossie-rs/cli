@@ -416,6 +416,7 @@ type StaticMount = (String, PathBuf);
 struct RevisionLink {
     pr_number: u64,
     status: String,
+    updated: Option<i64>,
     href: String,
 }
 
@@ -1647,8 +1648,9 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     write_mermaid_script(&output_dir, &state.assets.mermaid_script())?;
 
     for spec in &state.specs {
-        let rendered_html = render_spec_body(&state, spec, "".to_string(), "../")?;
-        let page = render_spec(&state, spec, &rendered_html, "../").into_string();
+        let prefix = relative_prefix_for_spec_id(&spec.id);
+        let rendered_html = render_spec_body(&state, spec, "".to_string(), &prefix)?;
+        let page = render_spec(&state, spec, &rendered_html, &prefix).into_string();
         let dest = output_dir.join(&spec.id).join("index.html");
         write_html_file(&dest, page)?;
 
@@ -2135,6 +2137,7 @@ fn build_pr_spec_version(
             .push(RevisionLink {
                 pr_number: pull.number,
                 status: pr_spec.status.clone(),
+                updated: pr_spec.updated,
                 href: pr_spec.id.clone(),
             });
     }
@@ -2530,8 +2533,7 @@ async fn status_index_page(state: web::Data<ReloadableAppState>) -> impl Respond
         }
         Err(err) => {
             eprintln!("Failed to load specs for status index: {err:?}");
-            HttpResponse::InternalServerError()
-                .body(format!("Failed to load status index: {err}"))
+            HttpResponse::InternalServerError().body(format!("Failed to load status index: {err}"))
         }
     }
 }
@@ -2695,6 +2697,12 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
         .filter(|(_, v, _, _)| !v.is_empty())
         .collect::<Vec<_>>();
     let revisions = state.revisions.get(&base_id);
+    let is_pr_page = spec.pr_number.is_some();
+    let original_link = spec.revision_of.as_ref().map(|id| {
+        let display = format_display_id(&state.display_prefix, id);
+        let href = join_prefix(prefix, id);
+        (display, href)
+    });
 
     let mini_toc_js = state.assets.mini_toc_script();
     let needs_mermaid = has_mermaid_markup(rendered_html);
@@ -2781,7 +2789,14 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                 }
             }
 
-            @if let Some(items) = revisions {
+            @if is_pr_page {
+                @if let Some((display, href)) = original_link.as_ref() {
+                    div class="spec-header" {
+                        span class="meta-label" { "ORIGINAL" }
+                        a class="spec-metadata-link" href=(href) { (display) }
+                    }
+                }
+            } @else if let Some(items) = revisions {
                 @if !items.is_empty() {
                     div class="spec-header" {
                         span class="meta-label" { "REVISIONS" }
@@ -2791,7 +2806,13 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                                 a class="spec-metadata-link" href={(join_prefix(prefix, revision.href.trim_start_matches('/')))} {
                                     (format!("PR #{}", revision.pr_number))
                                 }
-                                span class={(format!("tag {}", revision.status.to_lowercase()))} { (&revision.status) }
+                                span class="meta-note" {
+                                    " (last update: "
+                                    (format_iso_date(revision.updated).unwrap_or_else(|| "n/a".into()))
+                                    ", status: "
+                                    (&revision.status)
+                                    ")"
+                                }
                             }
                         }
                     }
@@ -2979,11 +3000,7 @@ fn render_status(
     )
 }
 
-fn render_status_index(
-    state: &AppState,
-    summaries: &[StatusSummary],
-    prefix: &str,
-) -> Markup {
+fn render_status_index(state: &AppState, summaries: &[StatusSummary], prefix: &str) -> Markup {
     let title = format!("Statuses - {}", state.site_name);
     let description = "Browse specs by status.".to_string();
 
@@ -3063,6 +3080,18 @@ fn join_prefix(prefix: &str, path: impl AsRef<str>) -> String {
         } else {
             format!("{normalized_prefix}{trimmed}")
         }
+    }
+}
+
+fn relative_prefix_for_spec_id(spec_id: &str) -> String {
+    let depth = spec_id
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
     }
 }
 
@@ -4169,6 +4198,12 @@ fn format_spec_date(timestamp: Option<i64>, include_time: bool) -> Option<String
     }
 }
 
+fn format_iso_date(timestamp: Option<i64>) -> Option<String> {
+    let ts = timestamp?;
+    let dt = Local.timestamp_millis_opt(ts).single()?;
+    Some(dt.format("%Y-%m-%d").to_string())
+}
+
 fn slugify_author(name: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
@@ -4199,20 +4234,18 @@ fn collect_status_summaries(specs: &[SpecDocument]) -> Vec<StatusSummary> {
     let mut summaries: HashMap<String, StatusSummary> = HashMap::new();
     for spec in specs.iter().filter(|spec| spec.listed) {
         let slug = slugify_status(&spec.status);
-        let entry = summaries.entry(slug.clone()).or_insert_with(|| StatusSummary {
-            name: spec.status.clone(),
-            slug,
-            count: 0,
-        });
+        let entry = summaries
+            .entry(slug.clone())
+            .or_insert_with(|| StatusSummary {
+                name: spec.status.clone(),
+                slug,
+                count: 0,
+            });
         entry.count += 1;
     }
 
     let mut collected: Vec<StatusSummary> = summaries.into_values().collect();
-    collected.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    collected.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
     collected
 }
 
