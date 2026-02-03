@@ -868,7 +868,7 @@ fn load_specs_from_directory(
             .unwrap_or_else(|| display_name.clone());
 
         let git_paths = git_repo.as_ref().map(|repo| {
-            collect_spec_git_paths(&doc_path, &static_root, &source, format)
+            collect_spec_git_paths(&spec_id, &doc_path, &static_root, &source, format)
                 .into_iter()
                 .filter_map(|path| {
                     path.strip_prefix(repo.workdir())
@@ -972,6 +972,7 @@ fn load_specs_from_directory(
 }
 
 fn collect_spec_git_paths(
+    spec_id: &str,
     doc_path: &Path,
     static_root: &Path,
     source: &str,
@@ -990,7 +991,7 @@ fn collect_spec_git_paths(
     paths.insert(doc);
 
     if let Ok(rendered) = DocRenderer::new().render(source, format) {
-        for asset in collect_doc_assets(&rendered) {
+        for asset in collect_doc_assets(&rendered, Some(spec_id)) {
             let asset_path = root.join(&asset);
             let resolved = asset_path
                 .canonicalize()
@@ -1100,6 +1101,7 @@ enum CliCommand {
     Build {
         input_path: PathBuf,
         output_dir: PathBuf,
+        trailing_slashes: bool,
     },
     Check(PathBuf),
     List(PathBuf),
@@ -1138,8 +1140,11 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
         CliCommand::Build {
             input_path,
             output_dir,
+            trailing_slashes,
         } => {
-            task::spawn_blocking(move || run_build(input_path, output_dir, config_path))
+            task::spawn_blocking(move || {
+                run_build(input_path, output_dir, config_path, trailing_slashes)
+            })
                 .await
                 .map_err(|err| anyhow!("build task failed: {err}"))??;
             Ok(())
@@ -1248,6 +1253,7 @@ fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
                         // Skip the value for --output if present.
                         let _ = args.next();
                     }
+                    "--trailing-slashes" => {}
                     _ if input_path.is_none() => input_path = Some(PathBuf::from(arg)),
                     _ => {}
                 }
@@ -1319,6 +1325,7 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
         "build" => {
             let mut input_path = None;
             let mut output_dir = None;
+            let mut trailing_slashes = false;
 
             let mut args = args.cloned();
 
@@ -1329,6 +1336,9 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
                             .next()
                             .ok_or_else(|| anyhow::anyhow!("Missing value for --output"))?;
                         output_dir = Some(PathBuf::from(path));
+                    }
+                    "--trailing-slashes" => {
+                        trailing_slashes = true;
                     }
                     _ if input_path.is_none() => {
                         input_path = Some(arg);
@@ -1342,6 +1352,7 @@ fn parse_command(args: &[String]) -> Result<CliCommand> {
             Ok(CliCommand::Build {
                 input_path: input,
                 output_dir: output,
+                trailing_slashes,
             })
         }
         "list" => {
@@ -1366,7 +1377,7 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  dossiers [-c <config-file>] serve [<path-to-spec-directory>]");
     eprintln!("  dossiers [-c <config-file>] prepare [<path-to-spec-directory>]");
-    eprintln!("  dossiers [-c <config-file>] build [<path-to-spec-directory>] [-o <output-dir>]");
+    eprintln!("  dossiers [-c <config-file>] build [<path-to-spec-directory>] [-o <output-dir>] [--trailing-slashes]");
     eprintln!("  dossiers [-c <config-file>] list [<path-to-spec-directory>]");
     eprintln!("  dossiers [-c <config-file>] check [<path-to-spec-directory>]");
 }
@@ -1607,7 +1618,12 @@ fn run_prepare(input_path: PathBuf, config_path: Option<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+fn run_build(
+    input_path: PathBuf,
+    output_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    trailing_slashes: bool,
+) -> Result<()> {
     let project_root = project_root_from(config_path.as_deref(), &input_path);
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
     let assets = Assets::embedded();
@@ -1642,19 +1658,26 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     let mount_map: HashMap<String, PathBuf> = static_mounts.into_iter().collect();
 
     let index_path = output_dir.join("index.html");
-    let index_html = render_index(&state, "./").into_string();
+    let index_html = render_index(&state, "./", trailing_slashes).into_string();
     write_html_file(&index_path, index_html)?;
     write_embedded_favicon(&output_dir)?;
     write_mermaid_script(&output_dir, &state.assets.mermaid_script())?;
 
     for spec in &state.specs {
         let prefix = relative_prefix_for_spec_id(&spec.id);
-        let rendered_html = render_spec_body(&state, spec, "".to_string(), &prefix)?;
-        let page = render_spec(&state, spec, &rendered_html, &prefix).into_string();
+        let asset_base = if trailing_slashes {
+            "".to_string()
+        } else {
+            join_prefix(&prefix, format!("{}/", spec.id))
+        };
+        let rendered_html =
+            render_spec_body(&state, spec, asset_base, &prefix, trailing_slashes)?;
+        let page =
+            render_spec(&state, spec, &rendered_html, &prefix, trailing_slashes).into_string();
         let dest = output_dir.join(&spec.id).join("index.html");
         write_html_file(&dest, page)?;
 
-        let asset_paths = collect_doc_assets(&rendered_html);
+        let asset_paths = collect_doc_assets(&rendered_html, Some(&spec.id));
         copy_doc_assets(&mount_map, &spec.id, &asset_paths, &output_dir)?;
     }
 
@@ -1670,7 +1693,8 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
             .iter()
             .filter(|spec| spec.authors.iter().any(|a| slugify_author(a) == slug))
             .collect();
-        let page = render_author(&state, &name, &authored, "../../").into_string();
+        let page =
+            render_author(&state, &name, &authored, "../../", trailing_slashes).into_string();
         let dest = output_dir.join("author").join(slug).join("index.html");
         write_html_file(&dest, page)?;
     }
@@ -1687,7 +1711,9 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
             .iter()
             .filter(|spec| spec.listed && slugify_status(&spec.status) == summary_slug)
             .collect();
-        let page = render_status(&state, &summary.name, &matching, "../../").into_string();
+        let page =
+            render_status(&state, &summary.name, &matching, "../../", trailing_slashes)
+                .into_string();
         let dest = output_dir
             .join("status")
             .join(&summary.slug)
@@ -1696,7 +1722,10 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
     }
 
     if !index_path.exists() {
-        write_html_file(&index_path, render_index(&state, "./").into_string())?;
+        write_html_file(
+            &index_path,
+            render_index(&state, "./", trailing_slashes).into_string(),
+        )?;
     }
 
     println!(
@@ -2291,24 +2320,36 @@ fn write_mermaid_script(output_root: &Path, mermaid_js: &str) -> Result<()> {
         .with_context(|| format!("Writing mermaid script to {}", target.display()))
 }
 
-fn collect_doc_assets(html: &str) -> Vec<String> {
+fn collect_doc_assets(html: &str, spec_id: Option<&str>) -> Vec<String> {
     lazy_static! {
         static ref ASSET_RE: Regex =
-            Regex::new(r#"(?i)\b(?:src|href)=['"]([^'"]*(?:attachments|images)/[^'">]+)"#).unwrap();
+            Regex::new(r#"(?i)\b(?:src|href)=['"]([^'">]+)['"]"#).unwrap();
     }
 
     ASSET_RE
         .captures_iter(html)
         .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-        .map(|raw| normalize_asset_path(&raw))
+        .map(|raw| normalize_asset_path(&raw, spec_id))
         .filter(|path| !path.is_empty())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect()
 }
 
-fn normalize_asset_path(raw: &str) -> String {
-    if raw.is_empty() || raw.starts_with('#') || raw.contains("://") {
+fn normalize_asset_path(raw: &str, spec_id: Option<&str>) -> String {
+    if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with('/')
+        || raw.starts_with("//")
+    {
+        return String::new();
+    }
+
+    lazy_static! {
+        static ref SCHEME_RE: Regex = Regex::new(r"(?i)^[a-z][a-z0-9+.\-]*:").unwrap();
+    }
+
+    if SCHEME_RE.is_match(raw) {
         return String::new();
     }
 
@@ -2328,6 +2369,12 @@ fn normalize_asset_path(raw: &str) -> String {
     while path.starts_with("../") {
         path = path.trim_start_matches("../").to_string();
     }
+    if let Some(spec_id) = spec_id {
+        if let Some(stripped) = path.strip_prefix(spec_id) {
+            path = stripped.trim_start_matches('/').to_string();
+        }
+    }
+
     path
 }
 
@@ -2422,7 +2469,7 @@ async fn mermaid_script(state: web::Data<ReloadableAppState>) -> impl Responder 
 async fn index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
     match state.load() {
         Ok(loaded) => {
-            let markup = render_index(&loaded, "/");
+            let markup = render_index(&loaded, "/", false);
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
                 .body(markup.into_string())
@@ -2462,7 +2509,13 @@ async fn spec_page(
             .finish();
     };
 
-    let rendered_html = match render_spec_body(&loaded, spec, format!("/{}/", spec.id), "/") {
+    let rendered_html = match render_spec_body(
+        &loaded,
+        spec,
+        format!("/{}/", spec.id),
+        "/",
+        false,
+    ) {
         Ok(html) => html,
         Err(err) => {
             eprintln!("Failed to render spec {spec_id}: {err:?}");
@@ -2471,7 +2524,7 @@ async fn spec_page(
         }
     };
 
-    let markup = render_spec(&loaded, spec, &rendered_html, "/");
+    let markup = render_spec(&loaded, spec, &rendered_html, "/", false);
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
@@ -2516,7 +2569,7 @@ async fn author_page(
         .cloned()
         .unwrap_or_else(|| slug.clone());
 
-    let markup = render_author(&loaded, &author_name, &authored, "/");
+    let markup = render_author(&loaded, &author_name, &authored, "/", false);
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
@@ -2570,13 +2623,13 @@ async fn status_page(
         .map(|spec| spec.status.clone())
         .unwrap_or_else(|| slug.clone());
 
-    let markup = render_status(&loaded, &status_name, &matching, "/");
+    let markup = render_status(&loaded, &status_name, &matching, "/", false);
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
 }
 
-fn render_index(state: &AppState, prefix: &str) -> Markup {
+fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Markup {
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
     let listed_specs: Vec<&SpecDocument> = state.specs.iter().filter(|spec| spec.listed).collect();
@@ -2605,7 +2658,7 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
+                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
                                 div class="spec-meta" {
                                     span class="spec-id" { "#" (base_id) }
                                 }
@@ -2646,7 +2699,13 @@ fn render_index(state: &AppState, prefix: &str) -> Markup {
     )
 }
 
-fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefix: &str) -> Markup {
+fn render_spec(
+    state: &AppState,
+    spec: &SpecDocument,
+    rendered_html: &str,
+    prefix: &str,
+    trailing_slashes: bool,
+) -> Markup {
     let base_id = spec.revision_of.clone().unwrap_or_else(|| spec.id.clone());
     let display_id = format_display_id(&state.display_prefix, &base_id);
     let page_id_label = format!("#{base_id}");
@@ -2700,7 +2759,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
     let is_pr_page = spec.pr_number.is_some();
     let original_link = spec.revision_of.as_ref().map(|id| {
         let display = format_display_id(&state.display_prefix, id);
-        let href = join_prefix(prefix, id);
+        let href = join_spec_link(prefix, id, "", trailing_slashes);
         (display, href)
     });
 
@@ -2803,7 +2862,7 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
                         span {
                             @for (index, revision) in items.iter().enumerate() {
                                 @if index > 0 { span class="meta-divider" { "•" } }
-                                a class="spec-metadata-link" href={(join_prefix(prefix, revision.href.trim_start_matches('/')))} {
+                                a class="spec-metadata-link" href={(join_spec_link(prefix, revision.href.trim_start_matches('/'), "", trailing_slashes))} {
                                     (format!("PR #{}", revision.pr_number))
                                 }
                                 span class="meta-note" {
@@ -2857,6 +2916,7 @@ fn render_author(
     author_name: &str,
     authored: &[&SpecDocument],
     prefix: &str,
+    trailing_slashes: bool,
 ) -> Markup {
     let title = format!("{author_name} - {}", state.site_name);
     let description = format!("All specs attributed to {author_name}");
@@ -2876,7 +2936,7 @@ fn render_author(
                 ul class="spec-list" {
                     @for spec in authored {
                         li {
-                            a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
+                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
                                 div class="spec-meta" {
                                 span class="spec-id" { "#" (spec.id) }
                                 }
@@ -2920,6 +2980,7 @@ fn render_status(
     status_name: &str,
     matching: &[&SpecDocument],
     prefix: &str,
+    trailing_slashes: bool,
 ) -> Markup {
     let title = format!("{status_name} specs - {}", state.site_name);
     let description = format!("All specs with status {status_name}");
@@ -2959,7 +3020,7 @@ fn render_status(
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
+                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
                                 div class="spec-meta" {
                                 span class="spec-id" { "#" (base_id) }
                                 }
@@ -3081,6 +3142,23 @@ fn join_prefix(prefix: &str, path: impl AsRef<str>) -> String {
             format!("{normalized_prefix}{trimmed}")
         }
     }
+}
+
+fn build_spec_path(spec_id: &str, fragment: &str, trailing_slashes: bool) -> String {
+    let base = spec_id.trim_end_matches('/');
+    if trailing_slashes {
+        if fragment.is_empty() {
+            format!("{base}/")
+        } else {
+            format!("{base}/{fragment}")
+        }
+    } else {
+        format!("{base}{fragment}")
+    }
+}
+
+fn join_spec_link(prefix: &str, spec_id: &str, fragment: &str, trailing_slashes: bool) -> String {
+    join_prefix(prefix, build_spec_path(spec_id, fragment, trailing_slashes))
 }
 
 fn relative_prefix_for_spec_id(spec_id: &str) -> String {
@@ -3265,6 +3343,7 @@ fn render_spec_body(
     spec: &SpecDocument,
     asset_base: String,
     link_prefix: &str,
+    trailing_slashes: bool,
 ) -> Result<String, RenderError> {
     let rendered = match state.renderer.render(&spec.source, spec.format) {
         Ok(html) => html,
@@ -3278,7 +3357,8 @@ fn render_spec_body(
     };
     let without_heading = remove_leading_heading(&rendered);
     let prefixed_assets = prefix_asset_urls(&without_heading, &asset_base);
-    let rewritten_links = rewrite_spec_links(&prefixed_assets, &state.spec_ids, link_prefix);
+    let rewritten_links =
+        rewrite_spec_links(&prefixed_assets, &state.spec_ids, link_prefix, trailing_slashes);
     Ok(rewritten_links)
 }
 
@@ -3779,8 +3859,12 @@ fn remove_leading_heading(html: &str) -> String {
 fn prefix_asset_urls(html: &str, asset_base: &str) -> String {
     lazy_static! {
         static ref ASSET_RE: Regex =
-            Regex::new(r#"(?i)\b(src|href)=([\"'])(\.?/?(attachments|images)/[^\"'>\s]+)"#)
-                .unwrap();
+            Regex::new(r#"(?i)\b(src|href)=(\"([^\"]+)\"|'([^']+)')"#).unwrap();
+        static ref SCHEME_RE: Regex = Regex::new(r"(?i)^[a-z][a-z0-9+.\-]*:").unwrap();
+        static ref SPEC_RE: Regex = Regex::new(
+            r#"(?i)^(?:\.\./)+(?:specs/)?(\d{4,})-[^/]+/[^#?]*?(?:\.adoc|\.md)?(#[-A-Za-z0-9_]+)?$"#
+        )
+        .unwrap();
     }
 
     let base = if asset_base.is_empty() || asset_base.ends_with('/') {
@@ -3791,30 +3875,57 @@ fn prefix_asset_urls(html: &str, asset_base: &str) -> String {
 
     ASSET_RE
         .replace_all(html, |caps: &regex::Captures| {
+            let original = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
             let attr = &caps[1];
-            let quote = &caps[2];
-            let value = caps[3].trim_start_matches("./").trim_start_matches('/');
+            let value = caps.get(3).or_else(|| caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+            let quote = if caps.get(3).is_some() { "\"" } else { "'" };
+            let attr_lower = attr.to_ascii_lowercase();
+            if value.is_empty()
+                || value.starts_with('#')
+                || value.starts_with('/')
+                || value.starts_with("//")
+                || SCHEME_RE.is_match(value)
+                || (attr_lower == "href" && SPEC_RE.is_match(value))
+            {
+                return original.to_string();
+            }
+
+            let mut value = value.trim_start_matches("./").trim_start_matches('/');
+            while value.starts_with("../") {
+                value = value.trim_start_matches("../");
+            }
             format!(r#"{attr}={quote}{base}{value}{quote}"#)
         })
         .to_string()
 }
 
-fn rewrite_spec_links(html: &str, spec_ids: &HashSet<String>, prefix: &str) -> String {
+fn rewrite_spec_links(
+    html: &str,
+    spec_ids: &HashSet<String>,
+    prefix: &str,
+    trailing_slashes: bool,
+) -> String {
     lazy_static! {
-        static ref HREF_RE: Regex = Regex::new(r#"(?i)\bhref=([\"'])([^\"']+)"#).unwrap();
+        static ref HREF_RE: Regex =
+            Regex::new(r#"(?i)\bhref=(\"([^\"]+)\"|'([^']+)')"#).unwrap();
     }
 
     HREF_RE
         .replace_all(html, |caps: &regex::Captures| {
-            let quote = &caps[1];
-            let url = &caps[2];
-            let rewritten = normalize_spec_link(url, spec_ids, prefix);
+            let url = caps.get(2).or_else(|| caps.get(3)).map(|m| m.as_str()).unwrap_or("");
+            let quote = if caps.get(2).is_some() { "\"" } else { "'" };
+            let rewritten = normalize_spec_link(url, spec_ids, prefix, trailing_slashes);
             format!(r#"href={quote}{rewritten}{quote}"#)
         })
         .to_string()
 }
 
-fn normalize_spec_link(url: &str, spec_ids: &HashSet<String>, prefix: &str) -> String {
+fn normalize_spec_link(
+    url: &str,
+    spec_ids: &HashSet<String>,
+    prefix: &str,
+    trailing_slashes: bool,
+) -> String {
     if url.is_empty() || url.starts_with('#') {
         return url.to_string();
     }
@@ -3838,7 +3949,7 @@ fn normalize_spec_link(url: &str, spec_ids: &HashSet<String>, prefix: &str) -> S
             .unwrap_or_default();
         let fragment = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         if spec_ids.contains(&spec_id) {
-            return join_prefix(prefix, format!("{spec_id}{fragment}"));
+            return join_spec_link(prefix, &spec_id, fragment, trailing_slashes);
         }
     }
 
