@@ -343,6 +343,20 @@ main {
   text-transform: uppercase;
 }
 
+a.tag {
+  text-decoration: none;
+}
+
+a.tag:hover {
+  text-decoration: none;
+  filter: brightness(0.97);
+}
+
+a.tag:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* .tag::before {
   content: '';
   width: 8px;
@@ -398,6 +412,13 @@ main {
   align-items: center;
   color: var(--muted);
   margin-top: 1rem;
+}
+
+.page-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
 }
 
 .spec-header {

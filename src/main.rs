@@ -112,6 +112,13 @@ struct SpecDocument {
     pr_number: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct StatusSummary {
+    name: String,
+    slug: String,
+    count: usize,
+}
+
 #[derive(Debug)]
 struct PendingSpec {
     id: String,
@@ -1556,6 +1563,10 @@ async fn run_server(input_path: PathBuf, config_path: Option<PathBuf>) -> Result
             .route("/assets/mermaid.min.js", web::get().to(mermaid_script))
             .route("/author/{slug}/", web::get().to(author_redirect))
             .route("/author/{slug}", web::get().to(author_page))
+            .route("/status", web::get().to(status_index_page))
+            .route("/status/", web::get().to(status_index_page))
+            .route("/status/{slug}/", web::get().to(status_redirect))
+            .route("/status/{slug}", web::get().to(status_page))
             .route("/{spec_id:\\d+}", web::get().to(spec_page))
             .route("/{spec_id:\\d+}/", web::get().to(spec_redirect));
 
@@ -1659,6 +1670,26 @@ fn run_build(input_path: PathBuf, output_dir: PathBuf, config_path: Option<PathB
             .collect();
         let page = render_author(&state, &name, &authored, "../../").into_string();
         let dest = output_dir.join("author").join(slug).join("index.html");
+        write_html_file(&dest, page)?;
+    }
+
+    let status_summaries = collect_status_summaries(&state.specs);
+    let status_index = render_status_index(&state, &status_summaries, "../").into_string();
+    let status_index_path = output_dir.join("status").join("index.html");
+    write_html_file(&status_index_path, status_index)?;
+
+    for summary in status_summaries {
+        let summary_slug = summary.slug.as_str();
+        let matching: Vec<&SpecDocument> = state
+            .specs
+            .iter()
+            .filter(|spec| spec.listed && slugify_status(&spec.status) == summary_slug)
+            .collect();
+        let page = render_status(&state, &summary.name, &matching, "../../").into_string();
+        let dest = output_dir
+            .join("status")
+            .join(&summary.slug)
+            .join("index.html");
         write_html_file(&dest, page)?;
     }
 
@@ -2488,6 +2519,61 @@ async fn author_page(
         .body(markup.into_string())
 }
 
+async fn status_index_page(state: web::Data<ReloadableAppState>) -> impl Responder {
+    match state.load() {
+        Ok(loaded) => {
+            let summaries = collect_status_summaries(&loaded.specs);
+            let markup = render_status_index(&loaded, &summaries, "/");
+            HttpResponse::Ok()
+                .content_type("text/html; charset=utf-8")
+                .body(markup.into_string())
+        }
+        Err(err) => {
+            eprintln!("Failed to load specs for status index: {err:?}");
+            HttpResponse::InternalServerError()
+                .body(format!("Failed to load status index: {err}"))
+        }
+    }
+}
+
+async fn status_redirect(path: web::Path<String>) -> impl Responder {
+    let slug = path.into_inner();
+    HttpResponse::MovedPermanently()
+        .append_header(("Location", format!("/status/{slug}")))
+        .finish()
+}
+
+async fn status_page(
+    path: web::Path<String>,
+    state: web::Data<ReloadableAppState>,
+) -> impl Responder {
+    let slug = path.into_inner();
+    let slug_value = slug.as_str();
+    let loaded = match state.load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("Failed to load specs for status page: {err:?}");
+            return HttpResponse::InternalServerError()
+                .body(format!("Failed to load status page: {err}"));
+        }
+    };
+    let matching: Vec<&SpecDocument> = loaded
+        .specs
+        .iter()
+        .filter(|spec| spec.listed && slugify_status(&spec.status) == slug_value)
+        .collect();
+
+    let status_name = matching
+        .first()
+        .map(|spec| spec.status.clone())
+        .unwrap_or_else(|| slug.clone());
+
+    let markup = render_status(&loaded, &status_name, &matching, "/");
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(markup.into_string())
+}
+
 fn render_index(state: &AppState, prefix: &str) -> Markup {
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
@@ -2628,7 +2714,12 @@ fn render_spec(state: &AppState, spec: &SpecDocument, rendered_html: &str, prefi
 
             div class="spec-header" {
                 span class="meta-label" { "" }
-                span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
+                a
+                    class={(format!("tag {}", spec.status.to_lowercase()))}
+                    href={(join_prefix(prefix, format!("status/{}", slugify_status(&spec.status))))}
+                {
+                    (&spec.status)
+                }
                 @if let Some((pr_text, pr_href)) = pr_review.as_ref() {
                     span { "—" }
                     span {
@@ -2773,6 +2864,152 @@ fn render_author(
                                     span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
                                     span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
                                     span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let css = state.assets.css();
+    let theme_init_js = state.assets.theme_init_script();
+    let theme_toggle_js = state.assets.theme_toggle_script();
+    base_layout(
+        &state.site_name,
+        &state.site_description,
+        &title,
+        &description,
+        LayoutAssets {
+            css: &css,
+            theme_init_js: &theme_init_js,
+            theme_toggle_js: &theme_toggle_js,
+            mermaid_js_url: None,
+            mermaid_init_js: None,
+        },
+        content,
+        prefix,
+        state.generated_at,
+    )
+}
+
+fn render_status(
+    state: &AppState,
+    status_name: &str,
+    matching: &[&SpecDocument],
+    prefix: &str,
+) -> Markup {
+    let title = format!("{status_name} specs - {}", state.site_name);
+    let description = format!("All specs with status {status_name}");
+    let index_search_js = state.assets.index_search_script();
+
+    let content = html! {
+        main class="container" {
+            div class="page-nav" {
+                a class="back-link" href={(join_prefix(prefix, ""))} { "← Back to index" }
+                a class="back-link" href={(join_prefix(prefix, "status"))} { "All statuses" }
+            }
+
+            section class="hero" {
+                h1 { "Status: " (status_name) }
+                p { "Browse specs with this status. Search by title, ID, or author." }
+                form class="search-bar" role="search" onsubmit="event.preventDefault();" {
+                    label class="sr-only" for="spec-search" { "Search specifications" }
+                    div class="search-input" {
+                        input id="spec-search" type="search" name="q" placeholder="Search by title, ID, or author" autocomplete="off" {}
+                        span class="search-hint" { "/" }
+                    }
+                }
+            }
+            div class="spec-header" {
+                span class={(format!("tag {}", status_name.to_lowercase()))} { (status_name) }
+                span class="spec-dir" { (format!("{} spec{}", matching.len(), if matching.len() == 1 { "" } else { "s" })) }
+            }
+
+            @if matching.is_empty() {
+                p class="empty-state" { "No specs found for this status." }
+            } @else {
+                ul class="spec-list" {
+                    @for spec in matching {
+                        @let base_id = spec.revision_of.as_deref().unwrap_or(&spec.id);
+                        li
+                            data-title={(spec.title.to_lowercase())}
+                            data-id={(base_id.to_lowercase())}
+                            data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
+                        {
+                            a class="spec-card" href={(join_prefix(prefix, &spec.id))} {
+                                div class="spec-meta" {
+                                span class="spec-id" { "#" (base_id) }
+                                }
+                                div class="spec-title" { (&spec.title) }
+                                div class="spec-meta-details" {
+                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
+                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
+                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
+                                }
+                            }
+                        }
+                    }
+                }
+                p class="empty-state filter-empty" hidden { "No specs match this search." }
+            }
+            }
+        script { (PreEscaped(index_search_js)) }
+    };
+
+    let css = state.assets.css();
+    let theme_init_js = state.assets.theme_init_script();
+    let theme_toggle_js = state.assets.theme_toggle_script();
+    base_layout(
+        &state.site_name,
+        &state.site_description,
+        &title,
+        &description,
+        LayoutAssets {
+            css: &css,
+            theme_init_js: &theme_init_js,
+            theme_toggle_js: &theme_toggle_js,
+            mermaid_js_url: None,
+            mermaid_init_js: None,
+        },
+        content,
+        prefix,
+        state.generated_at,
+    )
+}
+
+fn render_status_index(
+    state: &AppState,
+    summaries: &[StatusSummary],
+    prefix: &str,
+) -> Markup {
+    let title = format!("Statuses - {}", state.site_name);
+    let description = "Browse specs by status.".to_string();
+
+    let content = html! {
+        main class="container" {
+            a class="back-link" href={(join_prefix(prefix, ""))} { "← Back to index" }
+
+            section class="hero" {
+                h1 { "Statuses" }
+                p { "Browse specification documents grouped by status." }
+            }
+
+            @if summaries.is_empty() {
+                p class="empty-state" { "No statuses found." }
+            } @else {
+                ul class="spec-list" {
+                    @for summary in summaries {
+                        li {
+                            a class="spec-card" href={(join_prefix(prefix, format!("status/{}", summary.slug.as_str())))} {
+                                div class="spec-meta" {
+                                    span class="spec-id" { (summary.count) }
+                                    span class="spec-dir" { (format!("document{}", if summary.count == 1 { "" } else { "s" })) }
+                                }
+                                div class="spec-title" { (&summary.name) }
+                                div class="spec-meta-details" {
+                                    span class={(format!("tag {}", summary.name.to_lowercase()))} { (&summary.name) }
                                 }
                             }
                         }
@@ -3952,6 +4189,31 @@ fn slugify_author(name: &str) -> String {
     }
 
     slug.trim_matches('-').to_string()
+}
+
+fn slugify_status(status: &str) -> String {
+    slugify_author(status)
+}
+
+fn collect_status_summaries(specs: &[SpecDocument]) -> Vec<StatusSummary> {
+    let mut summaries: HashMap<String, StatusSummary> = HashMap::new();
+    for spec in specs.iter().filter(|spec| spec.listed) {
+        let slug = slugify_status(&spec.status);
+        let entry = summaries.entry(slug.clone()).or_insert_with(|| StatusSummary {
+            name: spec.status.clone(),
+            slug,
+            count: 0,
+        });
+        entry.count += 1;
+    }
+
+    let mut collected: Vec<StatusSummary> = summaries.into_values().collect();
+    collected.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    collected
 }
 
 fn resolve_site_name(_project_root: &Path, project_config: &ProjectConfiguration) -> String {
