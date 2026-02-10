@@ -1936,7 +1936,6 @@ fn map_pull_to_specs(
 ) -> Option<Vec<SpecTarget>> {
     let mut ignored_non_spec = 0usize;
     let pr_id = format!("{pr_number:04}");
-    let mut primary_relative: Option<PathBuf> = None;
     let mut targets: Vec<SpecTarget> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
 
@@ -1956,19 +1955,14 @@ fn map_pull_to_specs(
 
         let target_dir =
             spec_dir_for_relative_path(&relative_path, &current_id).unwrap_or_default();
-        let primary = relative_path.clone();
 
         if seen_ids.insert(target_id.clone()) {
             targets.push(SpecTarget {
                 spec_id: target_id,
-                spec_relative_dir: target_dir,
-                primary_relative: primary,
+                spec_relative_dir: target_dir.clone(),
+                primary_relative: target_dir,
                 used_pr_id: pr_number_as_spec_id && (current_id == "0000" || current_id == pr_id),
             });
-        }
-
-        if primary_relative.is_none() {
-            primary_relative = Some(relative_path);
         }
     }
 
