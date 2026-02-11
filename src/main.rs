@@ -425,6 +425,23 @@ struct CreateDocConfig {
     structure: String, // "directory" or "flat"
 }
 
+impl AppState {
+    /// Recompute `create_config.next_id` from the current `spec_ids` set.
+    /// Must be called after any late additions (e.g. PR specs) so that
+    /// the "Create new" button proposes a non-colliding ID.
+    fn refresh_next_id(&mut self) {
+        if let Some(ref mut config) = self.create_config {
+            config.next_id = self
+                .spec_ids
+                .iter()
+                .filter_map(|id| id.parse::<u64>().ok())
+                .max()
+                .map(|max| max + 1)
+                .unwrap_or(1);
+        }
+    }
+}
+
 type StaticMount = (String, PathBuf);
 
 #[derive(Clone)]
@@ -1667,6 +1684,9 @@ fn run_build(
     ) {
         eprintln!("Warning: failed to incorporate pull request revisions: {err}");
     }
+
+    // Recalculate next_id now that PR specs have been added to spec_ids
+    state.refresh_next_id();
 
     state.specs.sort_by(|a, b| {
         b.updated_sort
@@ -5384,6 +5404,80 @@ mod tests {
         assert!(
             updated >= created,
             "updated should be at least created, got created={created}, updated={updated}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn next_id_accounts_for_pr_specs() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "dossiers-next-id-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_millis()
+        ));
+
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).expect("create temp root");
+
+        // Create a single filesystem spec (0001)
+        let doc_path = temp_root.join("0001-existing.md");
+        fs::write(&doc_path, "# Existing Spec\n\nBody").expect("write document");
+
+        let reloadable = ReloadableAppState {
+            input_path: temp_root.clone(),
+            project_root: temp_root.clone(),
+            config_path: None,
+            assets: Assets::embedded(),
+        };
+        let mut state = reloadable.load().expect("load should succeed");
+
+        // Simulate a GitHub-enabled project by attaching a create_config.
+        // After loading only the filesystem spec, next_id should be 2.
+        state.create_config = Some(CreateDocConfig {
+            github_repo: "owner/repo".into(),
+            default_branch: "main".into(),
+            subdirectory: None,
+            next_id: 2,
+            format: "md".into(),
+            structure: "flat".into(),
+        });
+        assert_eq!(state.create_config.as_ref().unwrap().next_id, 2);
+
+        // Now simulate a PR spec being added with a higher numeric ID (e.g. PR #5 → "0005").
+        // This mirrors what augment_with_pull_requests does via insert_spec_document.
+        insert_spec_document(
+            &mut state,
+            SpecDocument {
+                id: "0005".into(),
+                dir_name: "0005-pr-feature".into(),
+                title: "PR Feature".into(),
+                status: "DRAFT".into(),
+                created: None,
+                updated: None,
+                authors: vec![],
+                links: vec![],
+                updated_sort: 0,
+                extra: HashMap::new(),
+                source: String::new(),
+                format: DocFormat::Markdown,
+                listed: true,
+                revision_of: None,
+                pr_number: Some(5),
+            },
+        );
+
+        // Before refresh, next_id is still stale at 2
+        assert_eq!(state.create_config.as_ref().unwrap().next_id, 2);
+
+        // After refresh it should account for the PR spec
+        state.refresh_next_id();
+        assert_eq!(
+            state.create_config.as_ref().unwrap().next_id,
+            6,
+            "next_id should be one past the highest spec ID including PR specs"
         );
 
         let _ = fs::remove_dir_all(&temp_root);
