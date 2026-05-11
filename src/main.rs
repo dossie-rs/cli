@@ -1759,42 +1759,6 @@ fn run_build(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct PushSyncRequest {
-    specs: Vec<PushSyncSpec>,
-    metadata: PushSyncMetadata,
-}
-
-#[derive(Debug, Serialize)]
-struct PushSyncMetadata {
-    commit: String,
-    branch: String,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PushSyncSpec {
-    id: String,
-    title: String,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    updated: Option<String>,
-    authors: Vec<String>,
-    content_html: String,
-    content_source: String,
-    format: String,
-    assets: Vec<PushAssetRef>,
-    extra: serde_json::Map<String, Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct PushAssetRef {
-    path: String,
-    url: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct PushSyncResponse {
     #[serde(default)]
@@ -1805,18 +1769,6 @@ struct PushSyncResponse {
     updated: usize,
     #[serde(default)]
     deleted: usize,
-    #[serde(default)]
-    asset_failures: Vec<PushAssetFailure>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PushAssetFailure {
-    #[serde(default)]
-    spec_id: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    error: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1863,61 +1815,50 @@ fn run_push(
         .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
         .unwrap_or_default();
 
-    let (specs, _mounts) = load_and_sort_specs(&input_path, &project_config)?;
-    if specs.is_empty() {
-        bail!("no specifications found at {}", input_path.display());
+    let resolved_input = resolve_spec_input_path(&input_path, &project_config);
+    let mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
+        .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
+    if mainline.specs.is_empty() {
+        bail!("no specifications found at {}", resolved_input.display());
     }
 
-    let renderer = DocRenderer::new();
-    let mut sync_specs: Vec<PushSyncSpec> = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        let content_html = renderer
-            .render(&spec.source, spec.format)
-            .map_err(|err| anyhow!("rendering spec {} failed: {err}", spec.id))?;
+    let project_config_bytes = resolve_config_path(&project_root, config_path.as_deref())
+        .and_then(|p| fs::read(&p).ok());
 
-        let referenced_assets = collect_doc_assets(&content_html, Some(&spec.id));
-        if !referenced_assets.is_empty() {
-            eprintln!(
-                "Note: spec {} references {} binary asset(s) that will not be transmitted (asset upload is not yet wired into push).",
-                spec.id,
-                referenced_assets.len()
-            );
-        }
-
-        let extra: serde_json::Map<String, Value> = spec.extra.clone().into_iter().collect();
-
-        sync_specs.push(PushSyncSpec {
-            id: spec.id.clone(),
-            title: spec.title.clone(),
-            status: spec.status.clone(),
-            created: format_iso_date(spec.created),
-            updated: format_iso_date(spec.updated),
-            authors: spec.authors.clone(),
-            content_html,
-            content_source: spec.source.clone(),
-            format: match spec.format {
-                DocFormat::Markdown => "markdown".to_string(),
-                DocFormat::Asciidoc => "asciidoc".to_string(),
-            },
-            assets: Vec::new(),
-            extra,
-        });
-    }
-
-    let timestamp = Utc::now().to_rfc3339();
-    let body = PushSyncRequest {
-        specs: sync_specs,
-        metadata: PushSyncMetadata {
-            commit: resolved_commit,
-            branch: resolved_branch,
-            timestamp,
+    let total_assets: usize = mainline.specs.iter().map(|s| s.assets.len()).sum();
+    let package = dossiers::bundle::Package {
+        manifest: dossiers::bundle::Manifest {
+            package_version: dossiers::bundle::PACKAGE_VERSION,
+            commit: empty_to_none(resolved_commit),
+            branch: empty_to_none(resolved_branch),
+            timestamp: Utc::now(),
+            source: dossiers::bundle::SourceMode::Push,
         },
+        project_config: project_config_bytes,
+        mainline,
+        pr_changes: Vec::new(),
     };
 
+    let mut buf = std::io::Cursor::new(Vec::new());
+    package
+        .write_zip(&mut buf)
+        .context("writing package zip")?;
+    let zip_bytes = buf.into_inner();
+
+    println!(
+        "Packaged {} spec(s) with {} binary asset(s) ({} bytes)",
+        package.mainline.specs.len(),
+        total_assets,
+        zip_bytes.len()
+    );
+
     if dry_run {
-        let json = serde_json::to_string_pretty(&body)
-            .context("serialising package for dry-run output")?;
-        println!("{json}");
+        let out_path = env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("dossiers-package.zip");
+        fs::write(&out_path, &zip_bytes)
+            .with_context(|| format!("writing dry-run package to {}", out_path.display()))?;
+        println!("Dry run: wrote package to {}", out_path.display());
         return Ok(());
     }
 
@@ -1926,11 +1867,7 @@ fn run_push(
         api_url = api_url_trimmed,
         project = project_resolved
     );
-    println!(
-        "Pushing {} spec(s) to {}",
-        body.specs.len(),
-        url
-    );
+    println!("Pushing to {url}");
 
     let client = reqwest::blocking::Client::builder()
         .build()
@@ -1938,7 +1875,8 @@ fn run_push(
     let response = client
         .post(&url)
         .bearer_auth(token_resolved.as_deref().unwrap_or(""))
-        .json(&body)
+        .header(reqwest::header::CONTENT_TYPE, "application/zip")
+        .body(zip_bytes)
         .send()
         .with_context(|| format!("sending sync request to {url}"))?;
 
@@ -1960,17 +1898,16 @@ fn run_push(
         "Synced {} spec(s): {} created, {} updated, {} deleted",
         parsed.synced, parsed.created, parsed.updated, parsed.deleted
     );
-    if !parsed.asset_failures.is_empty() {
-        eprintln!("Asset failures reported by server:");
-        for failure in &parsed.asset_failures {
-            eprintln!(
-                "  - spec {}: {} ({})",
-                failure.spec_id, failure.url, failure.error
-            );
-        }
-    }
 
     Ok(())
+}
+
+fn empty_to_none(s: String) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn augment_with_pull_requests(
