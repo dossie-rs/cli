@@ -27,6 +27,17 @@ impl GitRepository {
 
         None
     }
+
+    pub fn head_commit_sha(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        let commit = head.peel_to_commit().ok()?;
+        Some(commit.id().to_string())
+    }
+
+    pub fn current_branch(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        head.shorthand().map(|s| s.to_string())
+    }
 }
 
 pub fn open_git_repository(path: &Path) -> Option<GitRepository> {
