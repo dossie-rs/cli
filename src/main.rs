@@ -1972,6 +1972,8 @@ fn build_package(
     let project_config_bytes =
         resolve_config_path(project_root, config_path).and_then(|p| fs::read(&p).ok());
 
+    let specs_index = build_spec_index(&resolved_input, project_config, &mainline)?;
+
     let package = dossiers::bundle::Package {
         manifest: dossiers::bundle::Manifest {
             package_version: dossiers::bundle::PACKAGE_VERSION,
@@ -1979,6 +1981,7 @@ fn build_package(
             branch: empty_to_none(resolved_branch),
             timestamp: Utc::now(),
             source: dossiers::bundle::SourceMode::Push,
+            specs: specs_index,
         },
         project_config: project_config_bytes,
         mainline,
@@ -1992,6 +1995,43 @@ fn build_package(
     let zip_bytes = buf.into_inner();
 
     Ok((package, zip_bytes))
+}
+
+fn build_spec_index(
+    specs_dir: &Path,
+    project_config: &ProjectConfiguration,
+    mainline: &dossiers::bundle::Mainline,
+) -> Result<Vec<dossiers::bundle::SpecIndexEntry>> {
+    let load_result = load_specs_from_directory(specs_dir, project_config)
+        .with_context(|| format!("loading spec metadata at {}", specs_dir.display()))?;
+
+    let mut by_id: HashMap<String, SpecDocument> = load_result
+        .specs
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+
+    let mut entries = Vec::with_capacity(mainline.specs.len());
+    for spec in &mainline.specs {
+        let Some(doc) = by_id.remove(&spec.id) else { continue };
+        entries.push(dossiers::bundle::SpecIndexEntry {
+            id: spec.id.clone(),
+            dir_name: spec.dir_name.clone(),
+            source_path: spec.source_path.clone(),
+            format: spec.format,
+            title: doc.title,
+            status: doc.status,
+            created: doc.created.and_then(millis_to_utc),
+            updated: doc.updated.and_then(millis_to_utc),
+            authors: doc.authors,
+            extra: doc.extra.into_iter().collect(),
+        });
+    }
+    Ok(entries)
+}
+
+fn millis_to_utc(ms: i64) -> Option<chrono::DateTime<Utc>> {
+    chrono::Utc.timestamp_millis_opt(ms).single()
 }
 
 fn empty_to_none(s: String) -> Option<String> {

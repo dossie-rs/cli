@@ -10,7 +10,7 @@
 //! ```text
 //! manifest.json
 //! project.toml                (optional)
-//! mainline/specs/<dir>/<file>
+//! main/<dir>/<file>
 //! prs/<n>/meta.json
 //! prs/<n>/specs/<dir>/<file>
 //! ```
@@ -50,6 +50,31 @@ pub struct Manifest {
     pub timestamp: DateTime<Utc>,
     #[serde(default = "default_source_mode")]
     pub source: SourceMode,
+    /// Pre-computed index of every spec under `main/`. Carries the metadata
+    /// consumers need to build a listing without parsing each source file.
+    /// May be empty when produced by an older CLI; consumers should fall back
+    /// to deriving fields from the source bytes.
+    #[serde(default)]
+    pub specs: Vec<SpecIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecIndexEntry {
+    pub id: String,
+    pub dir_name: String,
+    /// Source file path relative to the spec directory, e.g. `"authentication.md"`.
+    pub source_path: String,
+    pub format: DocFormat,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_source_mode() -> SourceMode {
@@ -176,7 +201,7 @@ impl Package {
         }
 
         for spec in &self.mainline.specs {
-            write_spec(&mut zw, "mainline", spec, opts)?;
+            write_spec(&mut zw, "main", spec, opts)?;
         }
 
         for pr in &self.pr_changes {
@@ -209,9 +234,10 @@ impl Package {
             zw.start_file(format!("{prefix}/meta.json"), opts)?;
             zw.write_all(&serde_json::to_vec_pretty(&meta)?)?;
 
+            let pr_specs_prefix = format!("{prefix}/specs");
             for change in &pr.spec_changes {
                 if let SpecChange::Upsert(spec) = change {
-                    write_spec(&mut zw, &prefix, spec, opts)?;
+                    write_spec(&mut zw, &pr_specs_prefix, spec, opts)?;
                 }
             }
 
@@ -301,7 +327,7 @@ impl Package {
         let mut pr_meta: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
 
         for (name, bytes) in files {
-            if let Some(rest) = name.strip_prefix("mainline/specs/") {
+            if let Some(rest) = name.strip_prefix("main/") {
                 mainline_files.push((rest.to_string(), bytes));
                 continue;
             }
@@ -392,11 +418,11 @@ fn write_spec<W: Write + Seek>(
     spec: &Spec,
     opts: SimpleFileOptions,
 ) -> Result<(), BundleError> {
-    let src_path = format!("{prefix}/specs/{}/{}", spec.dir_name, spec.source_path);
+    let src_path = format!("{prefix}/{}/{}", spec.dir_name, spec.source_path);
     zw.start_file(src_path, opts)?;
     zw.write_all(&spec.source)?;
     for asset in &spec.assets {
-        let path = format!("{prefix}/specs/{}/{}", spec.dir_name, asset.path);
+        let path = format!("{prefix}/{}/{}", spec.dir_name, asset.path);
         zw.start_file(path, opts)?;
         zw.write_all(&asset.bytes)?;
     }
@@ -539,6 +565,7 @@ mod tests {
                 branch: Some("main".into()),
                 timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
                 source: SourceMode::Push,
+                specs: Vec::new(),
             },
             project_config: Some(b"# dossiers.toml\n".to_vec()),
             mainline: Mainline {
