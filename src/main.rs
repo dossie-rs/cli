@@ -1155,7 +1155,9 @@ impl Cli {
             | CliCommand::Prepare { path }
             | CliCommand::Check { path }
             | CliCommand::List { path } => path.as_ref()?,
-            CliCommand::Build { path, .. } | CliCommand::Push { path, .. } => path.as_ref()?,
+            CliCommand::Build { path, .. }
+            | CliCommand::Push { path, .. }
+            | CliCommand::Bundle { path, .. } => path.as_ref()?,
         };
         Some(absolutize_project_dir(path.clone()))
     }
@@ -1240,6 +1242,30 @@ enum CliCommand {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+
+    /// Assemble a package zip without pushing it (useful for debugging)
+    Bundle {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Output file for the package zip
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FILE",
+            default_value = "dossiers-bundle.zip"
+        )]
+        output: PathBuf,
+
+        /// Branch label to include in the package metadata
+        #[arg(long = "branch", value_name = "NAME")]
+        branch: Option<String>,
+
+        /// Commit SHA to include in the package metadata
+        #[arg(long = "commit", value_name = "SHA")]
+        commit: Option<String>,
+    },
 }
 
 #[actix_web::main]
@@ -1304,6 +1330,19 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             })
             .await
             .map_err(|err| anyhow!("push task failed: {err}"))?
+        }
+        CliCommand::Bundle {
+            path,
+            output,
+            branch,
+            commit,
+        } => {
+            let input_path = resolve_input(path)?;
+            task::spawn_blocking(move || {
+                run_bundle(input_path, config_path, output, branch, commit)
+            })
+            .await
+            .map_err(|err| anyhow!("bundle task failed: {err}"))?
         }
     }
 }
@@ -1807,44 +1846,16 @@ fn run_push(
         bail!("project token is required (use --token or $DOSSIERS_TOKEN)");
     }
 
-    let git_repo = open_git_repository(&project_root);
-    let resolved_branch = branch
-        .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
-        .unwrap_or_default();
-    let resolved_commit = commit
-        .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
-        .unwrap_or_default();
+    let (package, zip_bytes) = build_package(
+        &input_path,
+        &project_root,
+        &project_config,
+        config_path.as_deref(),
+        branch,
+        commit,
+    )?;
 
-    let resolved_input = resolve_spec_input_path(&input_path, &project_config);
-    let mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
-        .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
-    if mainline.specs.is_empty() {
-        bail!("no specifications found at {}", resolved_input.display());
-    }
-
-    let project_config_bytes = resolve_config_path(&project_root, config_path.as_deref())
-        .and_then(|p| fs::read(&p).ok());
-
-    let total_assets: usize = mainline.specs.iter().map(|s| s.assets.len()).sum();
-    let package = dossiers::bundle::Package {
-        manifest: dossiers::bundle::Manifest {
-            package_version: dossiers::bundle::PACKAGE_VERSION,
-            commit: empty_to_none(resolved_commit),
-            branch: empty_to_none(resolved_branch),
-            timestamp: Utc::now(),
-            source: dossiers::bundle::SourceMode::Push,
-        },
-        project_config: project_config_bytes,
-        mainline,
-        pr_changes: Vec::new(),
-    };
-
-    let mut buf = std::io::Cursor::new(Vec::new());
-    package
-        .write_zip(&mut buf)
-        .context("writing package zip")?;
-    let zip_bytes = buf.into_inner();
-
+    let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
     println!(
         "Packaged {} spec(s) with {} binary asset(s) ({} bytes)",
         package.mainline.specs.len(),
@@ -1900,6 +1911,87 @@ fn run_push(
     );
 
     Ok(())
+}
+
+fn run_bundle(
+    input_path: PathBuf,
+    config_path: Option<PathBuf>,
+    output: PathBuf,
+    branch: Option<String>,
+    commit: Option<String>,
+) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+
+    let (package, zip_bytes) = build_package(
+        &input_path,
+        &project_root,
+        &project_config,
+        config_path.as_deref(),
+        branch,
+        commit,
+    )?;
+
+    let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
+    fs::write(&output, &zip_bytes)
+        .with_context(|| format!("writing bundle to {}", output.display()))?;
+    println!(
+        "Bundled {} spec(s) with {} binary asset(s) ({} bytes) to {}",
+        package.mainline.specs.len(),
+        total_assets,
+        zip_bytes.len(),
+        output.display()
+    );
+
+    Ok(())
+}
+
+fn build_package(
+    input_path: &Path,
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+    config_path: Option<&Path>,
+    branch: Option<String>,
+    commit: Option<String>,
+) -> Result<(dossiers::bundle::Package, Vec<u8>)> {
+    let git_repo = open_git_repository(project_root);
+    let resolved_branch = branch
+        .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
+        .unwrap_or_default();
+    let resolved_commit = commit
+        .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
+        .unwrap_or_default();
+
+    let resolved_input = resolve_spec_input_path(input_path, project_config);
+    let mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
+        .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
+    if mainline.specs.is_empty() {
+        bail!("no specifications found at {}", resolved_input.display());
+    }
+
+    let project_config_bytes =
+        resolve_config_path(project_root, config_path).and_then(|p| fs::read(&p).ok());
+
+    let package = dossiers::bundle::Package {
+        manifest: dossiers::bundle::Manifest {
+            package_version: dossiers::bundle::PACKAGE_VERSION,
+            commit: empty_to_none(resolved_commit),
+            branch: empty_to_none(resolved_branch),
+            timestamp: Utc::now(),
+            source: dossiers::bundle::SourceMode::Push,
+        },
+        project_config: project_config_bytes,
+        mainline,
+        pr_changes: Vec::new(),
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    package
+        .write_zip(&mut buf)
+        .context("writing package zip")?;
+    let zip_bytes = buf.into_inner();
+
+    Ok((package, zip_bytes))
 }
 
 fn empty_to_none(s: String) -> Option<String> {
