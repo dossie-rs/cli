@@ -269,22 +269,39 @@ impl Package {
             )));
         }
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut spec_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+        // A spec is either a subdirectory (`0001-name/…`) or a single flat
+        // source file (`0001-name.md`). Both are keyed by an in-zip directory
+        // name so `group_specs` treats them uniformly.
+        let mut sources: Vec<(String, SpecSource)> = Vec::new();
         for entry in fs::read_dir(specs_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name.starts_with('.') || extract_spec_id(&name).is_none() {
                 continue;
             }
             let path = entry.path();
-            if !path.is_dir() || extract_spec_id(&name).is_none() {
-                continue;
+            if path.is_dir() {
+                sources.push((name, SpecSource::Dir(path)));
+            } else if path.is_file() && DocFormat::from_extension(&name).is_some() {
+                // Use the file stem as the directory name so `0001-name.md`
+                // becomes spec `0001-name` with source `0001-name.md`.
+                let dir_name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_string())
+                    .unwrap_or_else(|| name.clone());
+                sources.push((dir_name, SpecSource::File { name, path }));
             }
-            spec_dirs.push((name, path));
         }
-        spec_dirs.sort_by(|a, b| a.0.cmp(&b.0));
-        for (dir_name, dir_path) in spec_dirs {
-            visit_spec_dir(&dir_path, &dir_name, &mut entries)?;
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        for (dir_name, source) in sources {
+            match source {
+                SpecSource::Dir(dir_path) => visit_spec_dir(&dir_path, &dir_name, &mut entries)?,
+                SpecSource::File { name, path } => {
+                    let bytes = fs::read(&path)?;
+                    entries.push((format!("{dir_name}/{name}"), bytes));
+                }
+            }
         }
         Ok(Mainline {
             specs: group_specs(entries)?,
@@ -514,6 +531,16 @@ fn group_specs(files: Vec<(String, Vec<u8>)>) -> Result<Vec<Spec>, BundleError> 
     Ok(specs)
 }
 
+/// A mainline spec on disk: either a subdirectory of files or a single flat
+/// source file.
+enum SpecSource {
+    Dir(std::path::PathBuf),
+    File {
+        name: String,
+        path: std::path::PathBuf,
+    },
+}
+
 fn visit_spec_dir(
     dir: &Path,
     in_zip_prefix: &str,
@@ -690,6 +717,68 @@ mod tests {
             })
             .collect();
         assert_eq!(asset_removes, vec![("0002", "old.svg")]);
+    }
+
+    fn temp_specs_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dossiers-mainline-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp specs dir");
+        dir
+    }
+
+    #[test]
+    fn mainline_from_directory_reads_flat_files() {
+        // The React RFC layout: flat `NNNN-name.md` files, no per-spec dirs.
+        let dir = temp_specs_dir("flat");
+        fs::write(dir.join("0002-context.md"), b"# Context\n").unwrap();
+        fs::write(dir.join("0006-lifecycle.md"), b"# Lifecycle\n").unwrap();
+        fs::write(dir.join("README.md"), b"# not a spec\n").unwrap();
+        fs::write(dir.join(".hidden-0001-x.md"), b"# hidden\n").unwrap();
+
+        let mainline = Package::mainline_from_directory(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(mainline.specs.len(), 2);
+        let ctx = &mainline.specs[0];
+        assert_eq!(ctx.id, "0002");
+        assert_eq!(ctx.dir_name, "0002-context");
+        assert_eq!(ctx.source_path, "0002-context.md");
+        assert_eq!(ctx.format, DocFormat::Markdown);
+        assert_eq!(ctx.source, b"# Context\n");
+        assert!(ctx.assets.is_empty());
+        assert_eq!(mainline.specs[1].id, "0006");
+    }
+
+    #[test]
+    fn mainline_from_directory_mixes_files_and_dirs() {
+        let dir = temp_specs_dir("mixed");
+        fs::write(dir.join("0001-flat.md"), b"# Flat\n").unwrap();
+        let sub = dir.join("0002-nested");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("spec.md"), b"# Nested\n").unwrap();
+        fs::write(sub.join("diagram.png"), vec![137, 80, 78, 71]).unwrap();
+
+        let mainline = Package::mainline_from_directory(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(mainline.specs.len(), 2);
+        // Sorted by directory name: flat first, then nested.
+        assert_eq!(mainline.specs[0].id, "0001");
+        assert_eq!(mainline.specs[0].source_path, "0001-flat.md");
+        assert!(mainline.specs[0].assets.is_empty());
+
+        let nested = &mainline.specs[1];
+        assert_eq!(nested.id, "0002");
+        assert_eq!(nested.dir_name, "0002-nested");
+        assert_eq!(nested.source_path, "spec.md");
+        assert_eq!(nested.assets.len(), 1);
+        assert_eq!(nested.assets[0].path, "diagram.png");
     }
 
     #[test]
