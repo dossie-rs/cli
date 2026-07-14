@@ -12,7 +12,6 @@ mod metadata;
 use actix_files::Files;
 use actix_web::{rt::task, web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser as ClapParser, Subcommand};
 use asciidoc_parser::{
     attributes::Attrlist,
     blocks::{
@@ -24,6 +23,7 @@ use asciidoc_parser::{
     Parser as AsciidocParser,
 };
 use chrono::{Local, NaiveDate, TimeZone, Utc};
+use clap::{Parser as ClapParser, Subcommand};
 use dossiers::git_utils::{open_git_repository, GitTimestampCache};
 use dossiers::github::{parse_github_repo, GithubClient, GithubFile, GithubPull};
 use lazy_static::lazy_static;
@@ -1137,7 +1137,7 @@ enum RenderError {
                   into a navigable site. Preview specs locally, build a static site, \
                   validate metadata and cross-references, or push to a hosted server.",
     arg_required_else_help = true,
-    propagate_version = true,
+    propagate_version = true
 )]
 struct Cli {
     /// Path to a dossiers.toml configuration file
@@ -1186,7 +1186,12 @@ enum CliCommand {
         path: Option<PathBuf>,
 
         /// Output directory
-        #[arg(short = 'o', long = "output", value_name = "DIR", default_value = "output")]
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "DIR",
+            default_value = "output"
+        )]
         output_dir: PathBuf,
 
         /// Generate URLs ending with a trailing slash
@@ -1826,7 +1831,11 @@ fn run_push(
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
 
     let api_url_resolved = api_url
-        .or_else(|| env::var("DOSSIERS_API_URL").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            env::var("DOSSIERS_API_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .or_else(|| project_config.push_api_url.clone())
         .unwrap_or_else(|| "https://api.dossie.rs".to_string());
     let api_url_trimmed = api_url_resolved.trim_end_matches('/').to_string();
@@ -1840,8 +1849,11 @@ fn run_push(
             )
         })?;
 
-    let token_resolved = token
-        .or_else(|| env::var("DOSSIERS_TOKEN").ok().filter(|s| !s.trim().is_empty()));
+    let token_resolved = token.or_else(|| {
+        env::var("DOSSIERS_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
     if !dry_run && token_resolved.is_none() {
         bail!("project token is required (use --token or $DOSSIERS_TOKEN)");
     }
@@ -1989,9 +2001,7 @@ fn build_package(
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
-    package
-        .write_zip(&mut buf)
-        .context("writing package zip")?;
+    package.write_zip(&mut buf).context("writing package zip")?;
     let zip_bytes = buf.into_inner();
 
     Ok((package, zip_bytes))
@@ -2013,7 +2023,9 @@ fn build_spec_index(
 
     let mut entries = Vec::with_capacity(mainline.specs.len());
     for spec in &mainline.specs {
-        let Some(doc) = by_id.remove(&spec.id) else { continue };
+        let Some(doc) = by_id.remove(&spec.id) else {
+            continue;
+        };
         entries.push(dossiers::bundle::SpecIndexEntry {
             id: spec.id.clone(),
             dir_name: spec.dir_name.clone(),
@@ -2990,6 +3002,27 @@ async fn status_page(
         .body(markup.into_string())
 }
 
+fn spec_card(href: String, display_id: &str, spec: &SpecDocument) -> Markup {
+    html! {
+        a class="spec-card" href=(href) {
+            div class="spec-card-main" {
+                div class="spec-card-title-row" {
+                    span class="spec-id" { "#" (display_id) }
+                    span class="spec-title" { (&spec.title) }
+                }
+                div class="spec-card-byline" {
+                    @if !spec.authors.is_empty() {
+                        span class="byline-item byline-authors" { (spec.authors.join(", ")) }
+                    }
+                    span class="byline-item" { "Created " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
+                    span class="byline-item" { "Updated " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
+                }
+            }
+            span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
+        }
+    }
+}
+
 fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Markup {
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
@@ -3032,17 +3065,11 @@ fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Marku
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                    span class="spec-id" { "#" (base_id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                base_id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3335,17 +3362,11 @@ fn render_author(
                 ul class="spec-list" {
                     @for spec in authored {
                         li {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                span class="spec-id" { "#" (spec.id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                &spec.id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3419,17 +3440,11 @@ fn render_status(
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                span class="spec-id" { "#" (base_id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                base_id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3480,14 +3495,17 @@ fn render_status_index(state: &AppState, summaries: &[StatusSummary], prefix: &s
                     @for summary in summaries {
                         li {
                             a class="spec-card" href={(join_prefix(prefix, format!("status/{}", summary.slug.as_str())))} {
-                                div class="spec-meta" {
-                                    span class="spec-id" { (summary.count) }
-                                    span class="spec-dir" { (format!("document{}", if summary.count == 1 { "" } else { "s" })) }
+                                div class="spec-card-main" {
+                                    div class="spec-card-title-row" {
+                                        span class="spec-title" { (&summary.name) }
+                                    }
+                                    div class="spec-card-byline" {
+                                        span class="byline-item" {
+                                            (format!("{} document{}", summary.count, if summary.count == 1 { "" } else { "s" }))
+                                        }
+                                    }
                                 }
-                                div class="spec-title" { (&summary.name) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", summary.name.to_lowercase()))} { (&summary.name) }
-                                }
+                                span class={(format!("tag {}", summary.name.to_lowercase()))} { (&summary.name) }
                             }
                         }
                     }
@@ -3653,10 +3671,12 @@ fn base_layout(
                 (content)
                 footer class="site-footer" {
                     div class="container" {
-                        "Powered by "
-                        a href="https://dossie.rs" { "Dossiers" }
-                        " v" (version)
-                        span class="footer-label" { " • Built " (formatted_generated_at) }
+                        span class="footer-brand" {
+                            "Powered by "
+                            a href="https://dossie.rs" { "Dossiers" }
+                            " v" (version)
+                        }
+                        span class="footer-label" { "Built " (formatted_generated_at) }
                     }
                 }
                 @if let Some(mermaid_js_url) = mermaid_js_url {
