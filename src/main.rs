@@ -3000,6 +3000,27 @@ async fn status_page(
         .body(markup.into_string())
 }
 
+fn spec_card(href: String, display_id: &str, spec: &SpecDocument) -> Markup {
+    html! {
+        a class="spec-card" href=(href) {
+            div class="spec-card-main" {
+                div class="spec-card-title-row" {
+                    span class="spec-id" { "#" (display_id) }
+                    span class="spec-title" { (&spec.title) }
+                }
+                div class="spec-card-byline" {
+                    @if !spec.authors.is_empty() {
+                        span class="byline-item byline-authors" { (spec.authors.join(", ")) }
+                    }
+                    span class="byline-item" { "Created " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
+                    span class="byline-item" { "Updated " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
+                }
+            }
+            span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
+        }
+    }
+}
+
 fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Markup {
     let site_name = &state.site_name;
     let index_search_js = state.assets.index_search_script();
@@ -3042,17 +3063,11 @@ fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Marku
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                    span class="spec-id" { "#" (base_id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                base_id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3345,17 +3360,11 @@ fn render_author(
                 ul class="spec-list" {
                     @for spec in authored {
                         li {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                span class="spec-id" { "#" (spec.id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                &spec.id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3429,17 +3438,11 @@ fn render_status(
                             data-id={(base_id.to_lowercase())}
                             data-authors={(spec.authors.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" "))}
                         {
-                            a class="spec-card" href={(join_spec_link(prefix, &spec.id, "", trailing_slashes))} {
-                                div class="spec-meta" {
-                                span class="spec-id" { "#" (base_id) }
-                                }
-                                div class="spec-title" { (&spec.title) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", spec.status.to_lowercase()))} { (&spec.status) }
-                                    span { "Created: " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
-                                    span { "Updated: " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
-                                }
-                            }
+                            (spec_card(
+                                join_spec_link(prefix, &spec.id, "", trailing_slashes),
+                                base_id,
+                                spec,
+                            ))
                         }
                     }
                 }
@@ -3490,14 +3493,17 @@ fn render_status_index(state: &AppState, summaries: &[StatusSummary], prefix: &s
                     @for summary in summaries {
                         li {
                             a class="spec-card" href={(join_prefix(prefix, format!("status/{}", summary.slug.as_str())))} {
-                                div class="spec-meta" {
-                                    span class="spec-id" { (summary.count) }
-                                    span class="spec-dir" { (format!("document{}", if summary.count == 1 { "" } else { "s" })) }
+                                div class="spec-card-main" {
+                                    div class="spec-card-title-row" {
+                                        span class="spec-title" { (&summary.name) }
+                                    }
+                                    div class="spec-card-byline" {
+                                        span class="byline-item" {
+                                            (format!("{} document{}", summary.count, if summary.count == 1 { "" } else { "s" }))
+                                        }
+                                    }
                                 }
-                                div class="spec-title" { (&summary.name) }
-                                div class="spec-meta-details" {
-                                    span class={(format!("tag {}", summary.name.to_lowercase()))} { (&summary.name) }
-                                }
+                                span class={(format!("tag {}", summary.name.to_lowercase()))} { (&summary.name) }
                             }
                         }
                     }
@@ -3663,10 +3669,12 @@ fn base_layout(
                 (content)
                 footer class="site-footer" {
                     div class="container" {
-                        "Powered by "
-                        a href="https://dossie.rs" { "Dossiers" }
-                        " v" (version)
-                        span class="footer-label" { " • Built " (formatted_generated_at) }
+                        span class="footer-brand" {
+                            "Powered by "
+                            a href="https://dossie.rs" { "Dossiers" }
+                            " v" (version)
+                        }
+                        span class="footer-label" { "Built " (formatted_generated_at) }
                     }
                 }
                 @if let Some(mermaid_js_url) = mermaid_js_url {
