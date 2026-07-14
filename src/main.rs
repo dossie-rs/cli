@@ -567,16 +567,14 @@ fn parse_doc_metadata(source: &str, format: &DocFormat, fallback_title: &str) ->
             "updated" | "date" => {
                 updated = parse_date(value);
             }
-            "author" | "authors" => {
-                if !value.is_empty() {
-                    authors.extend(
-                        value
-                            .split([',', ';'])
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string()),
-                    );
-                }
+            "author" | "authors" if !value.is_empty() => {
+                authors.extend(
+                    value
+                        .split([',', ';'])
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                );
             }
             _ => {}
         }
