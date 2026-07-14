@@ -334,7 +334,9 @@ impl Package {
             if let Some(rest) = name.strip_prefix("prs/") {
                 let mut parts = rest.splitn(2, '/');
                 let Some(pr_str) = parts.next() else { continue };
-                let Some(remainder) = parts.next() else { continue };
+                let Some(remainder) = parts.next() else {
+                    continue;
+                };
                 let Ok(pr_num) = pr_str.parse::<u64>() else {
                     return Err(BundleError::Invalid(format!(
                         "invalid PR number in path: prs/{pr_str}/..."
@@ -542,7 +544,10 @@ fn visit_spec_dir(
 /// Extract the spec id from a directory name like `"0001-authentication"`.
 /// Requires at least four leading digits followed by `-`.
 pub fn extract_spec_id(dir_name: &str) -> Option<String> {
-    let digits: String = dir_name.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = dir_name
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.len() < 4 {
         return None;
     }
@@ -605,9 +610,7 @@ mod tests {
                         source: b"# Authentication (rewrite)\n".to_vec(),
                         assets: vec![],
                     }),
-                    SpecChange::Remove {
-                        id: "0099".into(),
-                    },
+                    SpecChange::Remove { id: "0099".into() },
                 ],
                 asset_changes: vec![AssetChange::Remove {
                     spec_id: "0002".into(),
@@ -629,7 +632,10 @@ mod tests {
         assert_eq!(decoded.manifest.commit.as_deref(), Some("abc123"));
         assert_eq!(decoded.manifest.branch.as_deref(), Some("main"));
         assert_eq!(decoded.manifest.source, SourceMode::Push);
-        assert_eq!(decoded.project_config.as_deref(), Some(&b"# dossiers.toml\n"[..]));
+        assert_eq!(
+            decoded.project_config.as_deref(),
+            Some(&b"# dossiers.toml\n"[..])
+        );
 
         assert_eq!(decoded.mainline.specs.len(), 2);
 
