@@ -54,6 +54,10 @@ pub struct ProjectConfiguration {
     pub default_branch: Option<String>,
     pub new_document_format: Option<String>,
     pub new_document_structure: Option<String>,
+    pub push_api_url: Option<String>,
+    pub push_project: Option<String>,
+    #[allow(dead_code)]
+    pub push_include_prs: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -684,6 +688,21 @@ impl ProjectConfiguration {
             .map(|s| s.trim().to_lowercase())
             .filter(|s| s == "directory" || s == "flat");
 
+        let push_section = value.get("push");
+        let push_api_url = push_section
+            .and_then(|v| v.get("api_url").or_else(|| v.get("apiUrl")))
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let push_project = push_section
+            .and_then(|v| v.get("project"))
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let push_include_prs = push_section
+            .and_then(|v| v.get("include_prs").or_else(|| v.get("includePrs")))
+            .and_then(JsonValue::as_bool);
+
         Self {
             name,
             title,
@@ -704,6 +723,9 @@ impl ProjectConfiguration {
             default_branch,
             new_document_format,
             new_document_structure,
+            push_api_url,
+            push_project,
+            push_include_prs,
         }
     }
 }

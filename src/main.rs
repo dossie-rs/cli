@@ -23,6 +23,7 @@ use asciidoc_parser::{
     Parser as AsciidocParser,
 };
 use chrono::{Local, NaiveDate, TimeZone, Utc};
+use clap::{Parser as ClapParser, Subcommand};
 use dossiers::git_utils::{open_git_repository, GitTimestampCache};
 use dossiers::github::{parse_github_repo, GithubClient, GithubFile, GithubPull};
 use lazy_static::lazy_static;
@@ -566,16 +567,14 @@ fn parse_doc_metadata(source: &str, format: &DocFormat, fallback_title: &str) ->
             "updated" | "date" => {
                 updated = parse_date(value);
             }
-            "author" | "authors" => {
-                if !value.is_empty() {
-                    authors.extend(
-                        value
-                            .split([',', ';'])
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string()),
-                    );
-                }
+            "author" | "authors" if !value.is_empty() => {
+                authors.extend(
+                    value
+                        .split([',', ';'])
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                );
             }
             _ => {}
         }
@@ -1127,35 +1126,158 @@ enum RenderError {
     Renderer(String),
 }
 
-#[derive(Debug)]
+#[derive(ClapParser, Debug)]
+#[command(
+    name = "dossiers",
+    version,
+    about = "Render, lint, and publish your specification repository",
+    long_about = "Dossiers organises a directory of Markdown or AsciiDoc specifications \
+                  into a navigable site. Preview specs locally, build a static site, \
+                  validate metadata and cross-references, or push to a hosted server.",
+    arg_required_else_help = true,
+    propagate_version = true
+)]
+struct Cli {
+    /// Path to a dossiers.toml configuration file
+    #[arg(short = 'c', long = "config", value_name = "FILE", global = true)]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+impl Cli {
+    fn project_dir(&self) -> Option<PathBuf> {
+        let path = match &self.command {
+            CliCommand::Serve { path }
+            | CliCommand::Prepare { path }
+            | CliCommand::Check { path }
+            | CliCommand::List { path } => path.as_ref()?,
+            CliCommand::Build { path, .. }
+            | CliCommand::Push { path, .. }
+            | CliCommand::Bundle { path, .. } => path.as_ref()?,
+        };
+        Some(absolutize_project_dir(path.clone()))
+    }
+}
+
+#[derive(Subcommand, Debug)]
 enum CliCommand {
-    Serve(PathBuf),
-    Prepare(PathBuf),
+    /// Preview specs locally on http://localhost:8080
+    Serve {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+
+    /// Render a normalised JSON snapshot of all specs to output.json
+    Prepare {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+
+    /// Render specs into a static HTML site
     Build {
-        input_path: PathBuf,
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Output directory
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "DIR",
+            default_value = "output"
+        )]
         output_dir: PathBuf,
+
+        /// Generate URLs ending with a trailing slash
+        #[arg(long = "trailing-slashes")]
         trailing_slashes: bool,
     },
-    Check(PathBuf),
-    List(PathBuf),
+
+    /// Lint specs for metadata, asset, and cross-reference issues
+    Check {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+
+    /// List discovered specs with title, status, and dates
+    List {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+
+    /// Package specs and push them to a Dossiers API server
+    Push {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// API server base URL [default: $DOSSIERS_API_URL or https://api.dossie.rs]
+        #[arg(long = "api-url", value_name = "URL")]
+        api_url: Option<String>,
+
+        /// Target project id or slug [default: $DOSSIERS_PROJECT or [push].project]
+        #[arg(long = "project", value_name = "ID")]
+        project: Option<String>,
+
+        /// Project token; required for a real push [default: $DOSSIERS_TOKEN]
+        #[arg(long = "token", value_name = "TOKEN")]
+        token: Option<String>,
+
+        /// Branch label to include in the package metadata
+        #[arg(long = "branch", value_name = "NAME")]
+        branch: Option<String>,
+
+        /// Commit SHA to include in the package metadata
+        #[arg(long = "commit", value_name = "SHA")]
+        commit: Option<String>,
+
+        /// Skip including WIP specs from open pull requests
+        #[arg(long = "no-prs")]
+        no_prs: bool,
+
+        /// Assemble and print the package without transmitting it
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// Assemble a package zip without pushing it (useful for debugging)
+    Bundle {
+        /// Spec source path (defaults to the current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Output file for the package zip
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FILE",
+            default_value = "dossiers-bundle.zip"
+        )]
+        output: PathBuf,
+
+        /// Branch label to include in the package metadata
+        #[arg(long = "branch", value_name = "NAME")]
+        branch: Option<String>,
+
+        /// Commit SHA to include in the package metadata
+        #[arg(long = "commit", value_name = "SHA")]
+        commit: Option<String>,
+    },
 }
 
 #[actix_web::main]
 async fn main() -> Result<()> {
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    let project_dir = project_dir_from_args(&raw_args);
+    let cli = Cli::parse();
+    let project_dir = cli.project_dir();
     print_banner(project_dir.as_deref());
 
-    let (config_path, command) = match parse_args(&raw_args) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            eprintln!("{err}");
-            print_usage();
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(err) = run_command(command, config_path).await {
+    if let Err(err) = run_command(cli.command, cli.config).await {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -1165,16 +1287,17 @@ async fn main() -> Result<()> {
 
 async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Result<()> {
     match command {
-        CliCommand::Serve(input_path) => run_server(input_path, config_path).await,
-        CliCommand::Prepare(input_path) => {
-            run_prepare(input_path, config_path)?;
+        CliCommand::Serve { path } => run_server(resolve_input(path)?, config_path).await,
+        CliCommand::Prepare { path } => {
+            run_prepare(resolve_input(path)?, config_path)?;
             Ok(())
         }
         CliCommand::Build {
-            input_path,
+            path,
             output_dir,
             trailing_slashes,
         } => {
+            let input_path = resolve_input(path)?;
             task::spawn_blocking(move || {
                 run_build(input_path, output_dir, config_path, trailing_slashes)
             })
@@ -1182,8 +1305,48 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             .map_err(|err| anyhow!("build task failed: {err}"))??;
             Ok(())
         }
-        CliCommand::Check(input_path) => run_check(input_path, config_path),
-        CliCommand::List(input_path) => run_list(input_path, config_path),
+        CliCommand::Check { path } => run_check(resolve_input(path)?, config_path),
+        CliCommand::List { path } => run_list(resolve_input(path)?, config_path),
+        CliCommand::Push {
+            path,
+            api_url,
+            project,
+            token,
+            branch,
+            commit,
+            no_prs,
+            dry_run,
+        } => {
+            let input_path = resolve_input(path)?;
+            task::spawn_blocking(move || {
+                run_push(
+                    input_path,
+                    config_path,
+                    api_url,
+                    project,
+                    token,
+                    branch,
+                    commit,
+                    no_prs,
+                    dry_run,
+                )
+            })
+            .await
+            .map_err(|err| anyhow!("push task failed: {err}"))?
+        }
+        CliCommand::Bundle {
+            path,
+            output,
+            branch,
+            commit,
+        } => {
+            let input_path = resolve_input(path)?;
+            task::spawn_blocking(move || {
+                run_bundle(input_path, config_path, output, branch, commit)
+            })
+            .await
+            .map_err(|err| anyhow!("bundle task failed: {err}"))?
+        }
     }
 }
 
@@ -1261,45 +1424,6 @@ fn supports_color() -> bool {
     env::var("COLORTERM").is_ok() || env::var("TERM").map(|t| t != "dumb").unwrap_or(false)
 }
 
-fn project_dir_from_args(args: &[String]) -> Option<PathBuf> {
-    let mut args = args.iter().peekable();
-    while let Some(flag) = args.peek() {
-        match flag.as_str() {
-            "-c" | "--config" => {
-                args.next();
-                let _ = args.next();
-            }
-            _ => break,
-        }
-    }
-
-    let command = args.next()?;
-
-    let raw_path = match command.as_str() {
-        "serve" | "prepare" => args.next().map(PathBuf::from),
-        "build" => {
-            let mut input_path = None;
-
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "-o" | "--output" => {
-                        // Skip the value for --output if present.
-                        let _ = args.next();
-                    }
-                    "--trailing-slashes" => {}
-                    _ if input_path.is_none() => input_path = Some(PathBuf::from(arg)),
-                    _ => {}
-                }
-            }
-
-            input_path
-        }
-        _ => None,
-    }?;
-
-    Some(absolutize_project_dir(raw_path))
-}
-
 fn absolutize_project_dir(path: PathBuf) -> PathBuf {
     let path = if path.is_absolute() {
         path
@@ -1312,111 +1436,8 @@ fn absolutize_project_dir(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
-fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand)> {
-    let mut iter = args.iter().peekable();
-    let mut config_path: Option<PathBuf> = None;
-
-    while let Some(flag) = iter.peek() {
-        match flag.as_str() {
-            "-c" | "--config" => {
-                iter.next();
-                let Some(path) = iter.next() else {
-                    bail!("Missing value for --config");
-                };
-                config_path = Some(PathBuf::from(path));
-            }
-            _ => break,
-        }
-    }
-
-    let remaining: Vec<String> = iter.cloned().collect();
-    let command = parse_command(&remaining)?;
-    Ok((config_path, command))
-}
-
-fn parse_command(args: &[String]) -> Result<CliCommand> {
-    let mut args = args.iter();
-    let Some(command) = args.next() else {
-        bail!("Missing command");
-    };
-
-    match command.as_str() {
-        "serve" => {
-            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
-            if args.next().is_some() {
-                bail!("Unexpected argument for serve");
-            }
-            Ok(CliCommand::Serve(validate_path(path)?))
-        }
-        "prepare" => {
-            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
-            if args.next().is_some() {
-                bail!("Unexpected argument for prepare");
-            }
-            Ok(CliCommand::Prepare(validate_path(path)?))
-        }
-        "build" => {
-            let mut input_path = None;
-            let mut output_dir = None;
-            let mut trailing_slashes = false;
-
-            let mut args = args.cloned();
-
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "-o" | "--output" => {
-                        let path = args
-                            .next()
-                            .ok_or_else(|| anyhow::anyhow!("Missing value for --output"))?;
-                        output_dir = Some(PathBuf::from(path));
-                    }
-                    "--trailing-slashes" => {
-                        trailing_slashes = true;
-                    }
-                    _ if input_path.is_none() => {
-                        input_path = Some(arg);
-                    }
-                    _ => bail!("Unexpected argument for build: {arg}"),
-                }
-            }
-
-            let input = validate_path(input_path.unwrap_or_else(|| ".".to_string()))?;
-            let output = output_dir.unwrap_or_else(|| PathBuf::from("output"));
-            Ok(CliCommand::Build {
-                input_path: input,
-                output_dir: output,
-                trailing_slashes,
-            })
-        }
-        "list" => {
-            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
-            if args.next().is_some() {
-                bail!("Unexpected argument for list");
-            }
-            Ok(CliCommand::List(validate_path(path)?))
-        }
-        "check" => {
-            let path = args.next().cloned().unwrap_or_else(|| ".".to_string());
-            if args.next().is_some() {
-                bail!("Unexpected argument for check");
-            }
-            Ok(CliCommand::Check(validate_path(path)?))
-        }
-        _ => bail!("Unknown command: {command}"),
-    }
-}
-
-fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  dossiers [-c <config-file>] serve [<path-to-spec-directory>]");
-    eprintln!("  dossiers [-c <config-file>] prepare [<path-to-spec-directory>]");
-    eprintln!("  dossiers [-c <config-file>] build [<path-to-spec-directory>] [-o <output-dir>] [--trailing-slashes]");
-    eprintln!("  dossiers [-c <config-file>] list [<path-to-spec-directory>]");
-    eprintln!("  dossiers [-c <config-file>] check [<path-to-spec-directory>]");
-}
-
-fn validate_path(path: String) -> Result<PathBuf> {
-    let input_path = PathBuf::from(path);
+fn resolve_input(path: Option<PathBuf>) -> Result<PathBuf> {
+    let input_path = path.unwrap_or_else(|| PathBuf::from("."));
     if !input_path.exists() {
         bail!("Spec source not found: {}", input_path.display());
     }
@@ -1778,6 +1799,257 @@ fn run_build(
         index_path.display()
     );
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct PushSyncResponse {
+    #[serde(default)]
+    synced: usize,
+    #[serde(default)]
+    created: usize,
+    #[serde(default)]
+    updated: usize,
+    #[serde(default)]
+    deleted: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_push(
+    input_path: PathBuf,
+    config_path: Option<PathBuf>,
+    api_url: Option<String>,
+    project: Option<String>,
+    token: Option<String>,
+    branch: Option<String>,
+    commit: Option<String>,
+    _no_prs: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+
+    let api_url_resolved = api_url
+        .or_else(|| {
+            env::var("DOSSIERS_API_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| project_config.push_api_url.clone())
+        .unwrap_or_else(|| "https://api.dossie.rs".to_string());
+    let api_url_trimmed = api_url_resolved.trim_end_matches('/').to_string();
+
+    let project_resolved = project
+        .or_else(|| env::var("DOSSIERS_PROJECT").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| project_config.push_project.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "project not specified (use --project, $DOSSIERS_PROJECT, or [push] project in dossiers.toml)"
+            )
+        })?;
+
+    let token_resolved = token.or_else(|| {
+        env::var("DOSSIERS_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    if !dry_run && token_resolved.is_none() {
+        bail!("project token is required (use --token or $DOSSIERS_TOKEN)");
+    }
+
+    let (package, zip_bytes) = build_package(
+        &input_path,
+        &project_root,
+        &project_config,
+        config_path.as_deref(),
+        branch,
+        commit,
+    )?;
+
+    let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
+    println!(
+        "Packaged {} spec(s) with {} binary asset(s) ({} bytes)",
+        package.mainline.specs.len(),
+        total_assets,
+        zip_bytes.len()
+    );
+
+    if dry_run {
+        let out_path = env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("dossiers-package.zip");
+        fs::write(&out_path, &zip_bytes)
+            .with_context(|| format!("writing dry-run package to {}", out_path.display()))?;
+        println!("Dry run: wrote package to {}", out_path.display());
+        return Ok(());
+    }
+
+    let url = format!(
+        "{api_url}/api/v1/projects/{project}/sync",
+        api_url = api_url_trimmed,
+        project = project_resolved
+    );
+    println!("Pushing to {url}");
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("building HTTP client")?;
+    let response = client
+        .post(&url)
+        .bearer_auth(token_resolved.as_deref().unwrap_or(""))
+        .header(reqwest::header::CONTENT_TYPE, "application/zip")
+        .body(zip_bytes)
+        .send()
+        .with_context(|| format!("sending sync request to {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        bail!(
+            "server returned {status}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+
+    let parsed: PushSyncResponse = response.json().context("parsing sync response")?;
+    println!(
+        "Synced {} spec(s): {} created, {} updated, {} deleted",
+        parsed.synced, parsed.created, parsed.updated, parsed.deleted
+    );
+
+    Ok(())
+}
+
+fn run_bundle(
+    input_path: PathBuf,
+    config_path: Option<PathBuf>,
+    output: PathBuf,
+    branch: Option<String>,
+    commit: Option<String>,
+) -> Result<()> {
+    let project_root = project_root_from(config_path.as_deref(), &input_path);
+    let project_config = load_project_configuration(&project_root, config_path.as_deref());
+
+    let (package, zip_bytes) = build_package(
+        &input_path,
+        &project_root,
+        &project_config,
+        config_path.as_deref(),
+        branch,
+        commit,
+    )?;
+
+    let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
+    fs::write(&output, &zip_bytes)
+        .with_context(|| format!("writing bundle to {}", output.display()))?;
+    println!(
+        "Bundled {} spec(s) with {} binary asset(s) ({} bytes) to {}",
+        package.mainline.specs.len(),
+        total_assets,
+        zip_bytes.len(),
+        output.display()
+    );
+
+    Ok(())
+}
+
+fn build_package(
+    input_path: &Path,
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+    config_path: Option<&Path>,
+    branch: Option<String>,
+    commit: Option<String>,
+) -> Result<(dossiers::bundle::Package, Vec<u8>)> {
+    let git_repo = open_git_repository(project_root);
+    let resolved_branch = branch
+        .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
+        .unwrap_or_default();
+    let resolved_commit = commit
+        .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
+        .unwrap_or_default();
+
+    let resolved_input = resolve_spec_input_path(input_path, project_config);
+    let mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
+        .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
+    if mainline.specs.is_empty() {
+        bail!("no specifications found at {}", resolved_input.display());
+    }
+
+    let project_config_bytes =
+        resolve_config_path(project_root, config_path).and_then(|p| fs::read(&p).ok());
+
+    let specs_index = build_spec_index(&resolved_input, project_config, &mainline)?;
+
+    let package = dossiers::bundle::Package {
+        manifest: dossiers::bundle::Manifest {
+            package_version: dossiers::bundle::PACKAGE_VERSION,
+            commit: empty_to_none(resolved_commit),
+            branch: empty_to_none(resolved_branch),
+            timestamp: Utc::now(),
+            source: dossiers::bundle::SourceMode::Push,
+            specs: specs_index,
+        },
+        project_config: project_config_bytes,
+        mainline,
+        pr_changes: Vec::new(),
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    package.write_zip(&mut buf).context("writing package zip")?;
+    let zip_bytes = buf.into_inner();
+
+    Ok((package, zip_bytes))
+}
+
+fn build_spec_index(
+    specs_dir: &Path,
+    project_config: &ProjectConfiguration,
+    mainline: &dossiers::bundle::Mainline,
+) -> Result<Vec<dossiers::bundle::SpecIndexEntry>> {
+    let load_result = load_specs_from_directory(specs_dir, project_config)
+        .with_context(|| format!("loading spec metadata at {}", specs_dir.display()))?;
+
+    let mut by_id: HashMap<String, SpecDocument> = load_result
+        .specs
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+
+    let mut entries = Vec::with_capacity(mainline.specs.len());
+    for spec in &mainline.specs {
+        let Some(doc) = by_id.remove(&spec.id) else {
+            continue;
+        };
+        entries.push(dossiers::bundle::SpecIndexEntry {
+            id: spec.id.clone(),
+            dir_name: spec.dir_name.clone(),
+            source_path: spec.source_path.clone(),
+            format: spec.format,
+            title: doc.title,
+            status: doc.status,
+            created: doc.created.and_then(millis_to_utc),
+            updated: doc.updated.and_then(millis_to_utc),
+            authors: doc.authors,
+            extra: doc.extra.into_iter().collect(),
+        });
+    }
+    Ok(entries)
+}
+
+fn millis_to_utc(ms: i64) -> Option<chrono::DateTime<Utc>> {
+    chrono::Utc.timestamp_millis_opt(ms).single()
+}
+
+fn empty_to_none(s: String) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn augment_with_pull_requests(
