@@ -56,6 +56,19 @@ pub struct Manifest {
     /// to deriving fields from the source bytes.
     #[serde(default)]
     pub specs: Vec<SpecIndexEntry>,
+    /// Base commit this package is a delta against. When set, the package is an
+    /// incremental update against a prior sync: consumers upsert the specs/PRs
+    /// present, apply the `deleted_*` removals, and prune nothing else. Absent
+    /// for a full snapshot (the historical behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Mainline spec ids removed since `base_commit`. Delta mode only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_specs: Vec<String>,
+    /// PR numbers whose revisions should be removed (closed PRs) since
+    /// `base_commit`. Delta mode only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_prs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +668,9 @@ mod tests {
                 timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
                 source: SourceMode::Push,
                 specs: Vec::new(),
+                base_commit: None,
+                deleted_specs: Vec::new(),
+                deleted_prs: Vec::new(),
             },
             project_config: Some(b"# dossiers.toml\n".to_vec()),
             mainline: Mainline {

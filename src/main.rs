@@ -797,6 +797,11 @@ fn load_specs_from_json(path: &Path, _config: &ProjectConfiguration) -> Result<L
 fn load_specs_from_directory(
     dir: &Path,
     project_config: &ProjectConfiguration,
+    // When `Some`, only these spec ids are loaded (an incremental sync scans
+    // just the changed specs). When `git_base` is `Some`, timestamps are derived
+    // from the bounded `base..HEAD` range instead of walking full history.
+    only_ids: Option<&HashSet<String>>,
+    git_base: Option<&str>,
 ) -> Result<LoadResult> {
     if !dir.is_dir() {
         bail!("Provided path is not a directory: {}", dir.display());
@@ -870,6 +875,11 @@ fn load_specs_from_directory(
         if seen_ids.contains(&spec_id) {
             continue;
         }
+        if let Some(only) = only_ids {
+            if !only.contains(&spec_id) {
+                continue;
+            }
+        }
         let file_entry = file_locations.get(&spec_id);
         let dir_entry = dir_locations.get(&spec_id);
 
@@ -937,10 +947,11 @@ fn load_specs_from_directory(
         if all_git_paths.is_empty() {
             None
         } else {
-            Some(GitTimestampCache::from_paths(
-                repo,
-                &all_git_paths.iter().cloned().collect::<Vec<_>>(),
-            ))
+            let paths: Vec<PathBuf> = all_git_paths.iter().cloned().collect();
+            Some(match git_base {
+                Some(base) => GitTimestampCache::since(repo, base, &paths),
+                None => GitTimestampCache::from_paths(repo, &paths),
+            })
         }
     } else {
         None
@@ -1040,7 +1051,7 @@ fn collect_spec_git_paths(
 
 fn load_specs(input_path: &Path, project_config: &ProjectConfiguration) -> Result<LoadResult> {
     if input_path.is_dir() {
-        load_specs_from_directory(input_path, project_config)
+        load_specs_from_directory(input_path, project_config, None, None)
     } else {
         load_specs_from_json(input_path, project_config)
     }
@@ -1832,66 +1843,45 @@ impl std::ops::AddAssign for PushSyncResponse {
     }
 }
 
-/// The server's last-synced ref per branch, from `GET .../sync/state`.
-#[derive(Debug, Default, Deserialize)]
-struct SyncStateResponse {
+/// The server's synced state, from `GET .../sync/state`. `pr_heads` being
+/// present is the signal that the server supports incremental (delta) uploads;
+/// an older server omits it (the field stays `None`) and the client falls back
+/// to a full snapshot push.
+#[derive(Debug, Deserialize)]
+struct SyncState {
     #[serde(default)]
     branches: HashMap<String, String>,
+    /// PR number (as a string) → head commit last synced. `None` on a server
+    /// that predates incremental sync.
+    pr_heads: Option<HashMap<String, String>>,
 }
 
-/// The branch → commit map the current working state would push: the mainline
-/// branch (resolved exactly as `build_package` does) plus every open PR's head
-/// commit. It mirrors what the server records on a successful sync, so an equal
-/// map means nothing has changed since last time and the push can be skipped.
-fn current_branch_refs(
-    project_root: &Path,
-    project_config: &ProjectConfiguration,
-    branch: Option<&str>,
-    commit: Option<&str>,
-    no_prs: bool,
-) -> HashMap<String, String> {
-    let mut refs = HashMap::new();
-
-    let git_repo = open_git_repository(project_root);
-    let resolved_branch = branch
-        .map(str::to_string)
-        .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
-        .unwrap_or_default();
-    let resolved_commit = commit
-        .map(str::to_string)
-        .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
-        .unwrap_or_default();
-    // The server records the mainline branch only when both are known.
-    if !resolved_branch.is_empty() && !resolved_commit.is_empty() {
-        refs.insert(resolved_branch, resolved_commit);
+/// Fetch the server's synced state. `None` on any error — offline, auth failure,
+/// or a server without the endpoint — so the caller falls back to a full sync.
+fn fetch_sync_state(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    project: &str,
+    token: &str,
+) -> Option<SyncState> {
+    let url = format!("{api_url}/api/v1/projects/{project}/sync/state");
+    let response = client.get(&url).bearer_auth(token).send().ok()?;
+    if !response.status().is_success() {
+        return None;
     }
-
-    if !no_prs {
-        for (branch, head_sha) in open_pr_branch_refs(project_root, project_config) {
-            refs.insert(branch, head_sha);
-        }
-    }
-
-    refs
+    response.json().ok()
 }
 
-/// `(branch, head_sha)` for every open PR, using the same branch fallback as
-/// `build_package`. Empty on any failure, or when PR gathering would be skipped
-/// anyway (no `GITHUB_TOKEN`, no GitHub repo) — the same conditions under which
-/// a real push carries no PR changes, so the comparison stays consistent.
-///
-/// This lists all open PRs (a cheap metadata call) rather than the subset that
-/// touch specs, so it may include extra branches the server never stored. That
-/// only ever suppresses a skip (forcing a harmless full sync); it never causes a
-/// skip when something changed, because a changed/opened/closed PR always makes
-/// the maps differ.
-fn open_pr_branch_refs(
+/// Every open PR's head SHA keyed by PR number, resolving the GitHub repo the
+/// same way PR gathering does. Empty when PRs would be skipped anyway (no
+/// `GITHUB_TOKEN` / no repo) or on failure — matching what a full push carries.
+fn open_pull_heads(
     project_root: &Path,
     project_config: &ProjectConfiguration,
-) -> Vec<(String, String)> {
+) -> HashMap<u64, String> {
     let token = match env::var("GITHUB_TOKEN") {
         Ok(value) if !value.trim().is_empty() => value,
-        _ => return Vec::new(),
+        _ => return HashMap::new(),
     };
     let git_repo = open_git_repository(project_root);
     let repo_from_config = project_config
@@ -1904,44 +1894,270 @@ fn open_pr_branch_refs(
         .as_deref()
         .and_then(parse_github_repo);
     let Some(github_repo) = repo_from_config.or(repo_from_git) else {
-        return Vec::new();
+        return HashMap::new();
     };
     let Ok(client) = GithubClient::new(github_repo, &token) else {
-        return Vec::new();
+        return HashMap::new();
     };
     let Ok(pulls) = client.list_open_pulls() else {
-        return Vec::new();
+        return HashMap::new();
     };
     pulls
         .into_iter()
         .filter(|pull| !pull.head_sha.is_empty())
-        .map(|pull| {
-            let branch = if pull.head_ref.is_empty() {
-                format!("pull/{}", pull.number)
-            } else {
-                pull.head_ref
-            };
-            (branch, pull.head_sha)
-        })
+        .map(|pull| (pull.number, pull.head_sha))
         .collect()
 }
 
-/// Fetch the server's last-synced branch → commit map. Returns `None` on any
-/// error — offline, auth failure, or an older server without the endpoint — so
-/// the caller falls back to a normal full sync.
-fn fetch_sync_state(
+/// Outcome of attempting an incremental push.
+enum DeltaOutcome {
+    /// A delta was pushed; carries the server's response counts.
+    Pushed(PushSyncResponse),
+    /// Nothing changed since the last sync — no push needed.
+    UpToDate,
+    /// A delta wasn't possible (first sync, old server, base lost, config
+    /// change, oversize, or a 409 base mismatch); do a full sync instead.
+    Fallback,
+}
+
+/// Try to push only what changed since the server's last-synced ref for this
+/// branch: mainline specs added/modified/deleted via `git diff base..HEAD`, and
+/// PRs whose head moved (plus deletes for closed PRs). Returns [`DeltaOutcome`];
+/// the caller does a full sync on `Fallback`.
+#[allow(clippy::too_many_arguments)]
+fn try_delta_push(
     client: &reqwest::blocking::Client,
     api_url: &str,
     project: &str,
     token: &str,
-) -> Option<HashMap<String, String>> {
-    let url = format!("{api_url}/api/v1/projects/{project}/sync/state");
-    let response = client.get(&url).bearer_auth(token).send().ok()?;
-    if !response.status().is_success() {
-        return None;
+    input_path: &Path,
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+    config_path: Option<&Path>,
+    branch: Option<&str>,
+    commit: Option<&str>,
+    no_prs: bool,
+    timeout_secs: u64,
+) -> Result<DeltaOutcome> {
+    // The state fetch is also the delta-capability probe: an older server
+    // (or none) has no `pr_heads`, so fall back to a full snapshot.
+    let Some(state) = fetch_sync_state(client, api_url, project, token) else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+    let Some(server_pr_heads) = state.pr_heads else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+
+    let Some(repo) = open_git_repository(project_root) else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+    let resolved_branch = branch
+        .map(str::to_string)
+        .or_else(|| repo.current_branch())
+        .unwrap_or_default();
+    let resolved_commit = commit
+        .map(str::to_string)
+        .or_else(|| repo.head_commit_sha())
+        .unwrap_or_default();
+    if resolved_branch.is_empty() || resolved_commit.is_empty() {
+        return Ok(DeltaOutcome::Fallback);
     }
-    let parsed: SyncStateResponse = response.json().ok()?;
-    Some(parsed.branches)
+
+    // The delta base is the server's last-synced commit for this branch. Absent
+    // (never synced) or lost from local history (force-push / shallow clone) →
+    // full sync.
+    let Some(base) = state.branches.get(&resolved_branch).cloned() else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+    if !repo.has_commit(&base) {
+        return Ok(DeltaOutcome::Fallback);
+    }
+
+    let resolved_input = resolve_spec_input_path(input_path, project_config);
+    let Some(changed) = repo.changed_paths_since(&base) else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+    let workdir = repo.workdir();
+    let Some(spec_rel) = relative_to(&resolved_input, workdir) else {
+        return Ok(DeltaOutcome::Fallback);
+    };
+    // A change to the project config can affect every spec's derived metadata,
+    // so it isn't expressible as a per-spec delta — force a full sync.
+    let config_rel =
+        resolve_config_path(project_root, config_path).and_then(|c| relative_to(&c, workdir));
+
+    let mut touched: HashSet<String> = HashSet::new();
+    for path in &changed {
+        if config_rel.as_deref() == Some(path.as_path()) {
+            return Ok(DeltaOutcome::Fallback);
+        }
+        if let Ok(rest) = path.strip_prefix(&spec_rel) {
+            if let Some(first) = rest.components().next() {
+                let name = first.as_os_str().to_string_lossy();
+                if let Some(id) = extract_spec_id(&name) {
+                    touched.insert(id);
+                }
+            }
+        }
+    }
+
+    // Scan the working tree once (cheap filesystem reads) to split touched specs
+    // into upserts (still present) vs deletes (gone), and to source content.
+    let full_mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
+        .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
+    let current_ids: HashSet<String> = full_mainline.specs.iter().map(|s| s.id.clone()).collect();
+    let mut upsert_ids: HashSet<String> = HashSet::new();
+    let mut deleted_specs: Vec<String> = Vec::new();
+    for id in touched {
+        if current_ids.contains(&id) {
+            upsert_ids.insert(id);
+        } else {
+            deleted_specs.push(id);
+        }
+    }
+
+    // PR delta: re-fetch only PRs whose head moved; delete PRs that have closed.
+    let server_pr_heads: HashMap<u64, String> = server_pr_heads
+        .into_iter()
+        .filter_map(|(k, v)| k.parse::<u64>().ok().map(|n| (n, v)))
+        .collect();
+    let (changed_prs, deleted_prs) = if no_prs {
+        // A `--no-prs` push carries no PRs, so every server PR is pruned.
+        (
+            Vec::new(),
+            server_pr_heads.keys().copied().collect::<Vec<_>>(),
+        )
+    } else {
+        let open_heads = open_pull_heads(project_root, project_config);
+        let deleted: Vec<u64> = server_pr_heads
+            .keys()
+            .filter(|n| !open_heads.contains_key(n))
+            .copied()
+            .collect();
+        let changed = gather_pr_changes_for_package(
+            project_root,
+            project_config,
+            &resolved_input,
+            &server_pr_heads,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("Warning: failed to gather PR revisions: {err}");
+            Vec::new()
+        });
+        (changed, deleted)
+    };
+
+    if upsert_ids.is_empty()
+        && deleted_specs.is_empty()
+        && changed_prs.is_empty()
+        && deleted_prs.is_empty()
+    {
+        return Ok(DeltaOutcome::UpToDate);
+    }
+
+    // Assemble the delta package: only the upserted specs (content + index),
+    // with the explicit deletes and PR changes recorded in the manifest.
+    let mut mainline = full_mainline;
+    mainline.specs.retain(|s| upsert_ids.contains(&s.id));
+    let specs_index = build_spec_index(
+        &resolved_input,
+        project_config,
+        &mainline,
+        Some(&upsert_ids),
+        Some(&base),
+    )?;
+    let project_config_bytes =
+        resolve_config_path(project_root, config_path).and_then(|p| fs::read(&p).ok());
+
+    let package = dossiers::bundle::Package {
+        manifest: dossiers::bundle::Manifest {
+            package_version: dossiers::bundle::PACKAGE_VERSION,
+            commit: empty_to_none(resolved_commit),
+            branch: empty_to_none(resolved_branch),
+            timestamp: Utc::now(),
+            source: dossiers::bundle::SourceMode::Push,
+            specs: specs_index,
+            base_commit: Some(base),
+            deleted_specs,
+            deleted_prs,
+        },
+        project_config: project_config_bytes,
+        mainline,
+        pr_changes: changed_prs,
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    package
+        .write_zip(&mut buf)
+        .context("writing delta package")?;
+    let zip_bytes = buf.into_inner();
+
+    // A delta big enough to exceed the single-request limit is rare; rather than
+    // chunk a delta (which the server doesn't apply), fall back to a full sync.
+    if zip_bytes.len() > SINGLE_SHOT_MAX_BYTES {
+        return Ok(DeltaOutcome::Fallback);
+    }
+
+    let sync_url = format!("{api_url}/api/v1/projects/{project}/sync");
+    println!(
+        "Incremental sync to {sync_url}: {} spec(s) changed, {} deleted, \
+         {} PR change-set(s), {} PR(s) closed ({} bytes)",
+        package.mainline.specs.len(),
+        package.manifest.deleted_specs.len(),
+        package.pr_changes.len(),
+        package.manifest.deleted_prs.len(),
+        zip_bytes.len(),
+    );
+
+    match post_delta(client, &sync_url, token, zip_bytes, timeout_secs)? {
+        Some(resp) => Ok(DeltaOutcome::Pushed(resp)),
+        None => {
+            eprintln!("Server rejected the delta (sync base out of date); doing a full sync.");
+            Ok(DeltaOutcome::Fallback)
+        }
+    }
+}
+
+/// POST a delta package. `Ok(Some(_))` on success, `Ok(None)` on a 409 (the
+/// server's base moved under us — retry with a full sync), `Err` otherwise.
+fn post_delta(
+    client: &reqwest::blocking::Client,
+    sync_url: &str,
+    token: &str,
+    zip_bytes: Vec<u8>,
+    timeout_secs: u64,
+) -> Result<Option<PushSyncResponse>> {
+    let response = client
+        .post(sync_url)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/zip")
+        .body(zip_bytes)
+        .send()
+        .map_err(|err| {
+            if err.is_timeout() {
+                anyhow!("push to {sync_url} timed out after {timeout_secs}s.")
+            } else if err.is_connect() {
+                anyhow!("could not connect to {sync_url}: {err}")
+            } else {
+                anyhow::Error::new(err).context(format!("sending sync request to {sync_url}"))
+            }
+        })?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Ok(None);
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        bail!(
+            "server returned {status}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+    Ok(Some(response.json().context("parsing sync response")?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2004,30 +2220,40 @@ fn run_push(
     }
     let client = builder.build().context("building HTTP client")?;
 
-    // Pre-flight: skip the whole scan / bundle / upload when the server already
-    // holds the exact branch → commit state this push would produce — the
-    // mainline HEAD plus every open PR head. Best-effort: any error, or an older
-    // server without the /sync/state endpoint, falls through to a full sync.
+    // Incremental fast path: push only what changed since the server's last
+    // synced ref for this branch. Falls through to a full sync when a delta
+    // isn't possible (first sync, older server, base lost, config change,
+    // oversize, or a 409 base mismatch).
     if !dry_run {
         let token = token_resolved.as_deref().unwrap_or("");
-        let current = current_branch_refs(
+        match try_delta_push(
+            &client,
+            &api_url_trimmed,
+            &project_resolved,
+            token,
+            &input_path,
             &project_root,
             &project_config,
+            config_path.as_deref(),
             branch.as_deref(),
             commit.as_deref(),
             no_prs,
-        );
-        if !current.is_empty() {
-            if let Some(server) =
-                fetch_sync_state(&client, &api_url_trimmed, &project_resolved, token)
-            {
-                if current == server {
-                    println!(
-                        "Nothing to sync: the current branch and open PRs already match the last sync."
-                    );
-                    return Ok(());
-                }
+            timeout_secs,
+        )? {
+            DeltaOutcome::Pushed(resp) => {
+                println!(
+                    "Synced incrementally: {} created, {} updated, {} deleted, {} PR revision(s)",
+                    resp.created, resp.updated, resp.deleted, resp.pr_revisions
+                );
+                return Ok(());
             }
+            DeltaOutcome::UpToDate => {
+                println!(
+                    "Nothing to sync: already up to date with the current branch and open PRs."
+                );
+                return Ok(());
+            }
+            DeltaOutcome::Fallback => {}
         }
     }
 
@@ -2338,17 +2564,21 @@ fn build_package(
     let project_config_bytes =
         resolve_config_path(project_root, config_path).and_then(|p| fs::read(&p).ok());
 
-    let specs_index = build_spec_index(&resolved_input, project_config, &mainline)?;
+    let specs_index = build_spec_index(&resolved_input, project_config, &mainline, None, None)?;
 
     let pr_changes = if no_prs {
         Vec::new()
     } else {
-        gather_pr_changes_for_package(project_root, project_config, &resolved_input).unwrap_or_else(
-            |err| {
-                eprintln!("Warning: failed to gather PR revisions: {err}");
-                Vec::new()
-            },
+        gather_pr_changes_for_package(
+            project_root,
+            project_config,
+            &resolved_input,
+            &HashMap::new(),
         )
+        .unwrap_or_else(|err| {
+            eprintln!("Warning: failed to gather PR revisions: {err}");
+            Vec::new()
+        })
     };
 
     let package = dossiers::bundle::Package {
@@ -2359,6 +2589,9 @@ fn build_package(
             timestamp: Utc::now(),
             source: dossiers::bundle::SourceMode::Push,
             specs: specs_index,
+            base_commit: None,
+            deleted_specs: Vec::new(),
+            deleted_prs: Vec::new(),
         },
         project_config: project_config_bytes,
         mainline,
@@ -2376,8 +2609,10 @@ fn build_spec_index(
     specs_dir: &Path,
     project_config: &ProjectConfiguration,
     mainline: &dossiers::bundle::Mainline,
+    only_ids: Option<&HashSet<String>>,
+    git_base: Option<&str>,
 ) -> Result<Vec<dossiers::bundle::SpecIndexEntry>> {
-    let load_result = load_specs_from_directory(specs_dir, project_config)
+    let load_result = load_specs_from_directory(specs_dir, project_config, only_ids, git_base)
         .with_context(|| format!("loading spec metadata at {}", specs_dir.display()))?;
 
     let mut by_id: HashMap<String, SpecDocument> = load_result
@@ -2881,6 +3116,9 @@ fn gather_pr_changes_for_package(
     project_root: &Path,
     project_config: &ProjectConfiguration,
     spec_root: &Path,
+    // PRs whose head matches `skip_unchanged[number]` are not re-fetched (an
+    // incremental sync passes the server's known heads here). Empty = fetch all.
+    skip_unchanged: &HashMap<u64, String>,
 ) -> Result<Vec<dossiers::bundle::PrChangeSet>> {
     let token = match env::var("GITHUB_TOKEN") {
         Ok(value) if !value.trim().is_empty() => value,
@@ -2932,9 +3170,11 @@ fn gather_pr_changes_for_package(
         &spec_root_relative,
         project_config.pr_number_as_spec_id,
         &repo_slug,
+        skip_unchanged,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_pr_changes(
     client: &GithubClient,
     metadata_reader: &MetadataReader,
@@ -2942,6 +3182,7 @@ fn gather_pr_changes(
     spec_root_relative: &Path,
     pr_number_as_spec_id: bool,
     repo_slug: &str,
+    skip_unchanged: &HashMap<u64, String>,
 ) -> Result<Vec<dossiers::bundle::PrChangeSet>> {
     let pulls = client
         .list_open_pulls()
@@ -2954,6 +3195,14 @@ fn gather_pr_changes(
 
     let mut change_sets = Vec::new();
     for pull in pulls {
+        // Incremental sync: a PR whose head is unchanged since the last sync is
+        // already on the server; don't re-fetch its files.
+        if skip_unchanged
+            .get(&pull.number)
+            .is_some_and(|sha| sha == &pull.head_sha)
+        {
+            continue;
+        }
         let files = match client.list_pull_files(pull.number) {
             Ok(files) => files,
             Err(err) => {
