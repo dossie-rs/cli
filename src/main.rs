@@ -1312,6 +1312,12 @@ enum CliCommand {
         /// Assemble and print the package without transmitting it
         #[arg(long = "dry-run")]
         dry_run: bool,
+
+        /// Push a full snapshot, skipping the incremental fast-path. Use when a
+        /// change outside the git diff (e.g. edited project config, or a new
+        /// server capability) means every spec must be re-sent.
+        #[arg(long = "full")]
+        full: bool,
     },
 
     /// Assemble a package zip without pushing it (useful for debugging)
@@ -1385,6 +1391,7 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             no_prs,
             timeout,
             dry_run,
+            full,
         } => {
             let input_path = resolve_input(path)?;
             task::spawn_blocking(move || {
@@ -1399,6 +1406,7 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
                     no_prs,
                     timeout,
                     dry_run,
+                    full,
                 )
             })
             .await
@@ -2257,6 +2265,7 @@ fn run_push(
     no_prs: bool,
     timeout: Option<u64>,
     dry_run: bool,
+    full: bool,
 ) -> Result<()> {
     let project_root = project_root_from(config_path.as_deref(), &input_path);
     let project_config = load_project_configuration(&project_root, config_path.as_deref());
@@ -2308,8 +2317,9 @@ fn run_push(
     // Incremental fast path: push only what changed since the server's last
     // synced ref for this branch. Falls through to a full sync when a delta
     // isn't possible (first sync, older server, base lost, config change,
-    // oversize, or a 409 base mismatch).
-    if !dry_run {
+    // oversize, or a 409 base mismatch). `--full` opts out entirely and always
+    // sends a full snapshot.
+    if !dry_run && !full {
         let token = token_resolved.as_deref().unwrap_or("");
         match try_delta_push(
             &client,
