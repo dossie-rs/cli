@@ -7,6 +7,8 @@ autobins = false
 homepage = "https://dossie.rs"
 repository = "https://github.com/dossie-rs/cli"
 license = "MIT"
+# The npm/ dir is the npm-wrapper package (published separately, not part of the crate).
+exclude = ["/npm"]
 
 [[bin]]
 name = "dossiers"

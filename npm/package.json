@@ -1,0 +1,21 @@
+{
+	"name": "dossiers",
+	"version": "0.0.0",
+	"description": "Dossiers: A home for your specs, policies, and process docs",
+	"homepage": "https://dossie.rs",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/dossie-rs/cli.git"
+	},
+	"license": "MIT",
+	"bin": {
+		"dossiers": "run.js"
+	},
+	"files": [
+		"install.js",
+		"run.js"
+	],
+	"scripts": {
+		"postinstall": "node install.js"
+	}
+}
