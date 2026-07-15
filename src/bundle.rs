@@ -88,6 +88,42 @@ pub struct SpecIndexEntry {
     pub authors: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, serde_json::Value>,
+    /// Producer-resolved outbound links (the document's `links:` frontmatter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<MetaLink>,
+    /// Producer-resolved, render-ready extra metadata rows (the configured
+    /// `extra_metadata_fields`). Carries the display representation the raw
+    /// `extra` map can't express; `extra` remains the machine-readable map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<MetaField>,
+}
+
+/// A producer-resolved outbound link, rendered under the "Links" metadata row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLink {
+    pub label: String,
+    pub href: String,
+}
+
+/// A producer-resolved, render-ready extra metadata row. The producer applies
+/// the project's field configuration (display name, type, link format) so
+/// consumers render it verbatim without re-parsing the source or holding the
+/// config. `value` is plain text unless `html` is set, in which case it is
+/// trusted pre-rendered HTML (a Markdown-typed field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaField {
+    pub label: String,
+    pub value: String,
+    /// When set, the value is wrapped in a link to this href.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    /// The `value` is trusted pre-rendered HTML rather than plain text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub html: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_source_mode() -> SourceMode {
@@ -184,6 +220,12 @@ pub struct PrSpecMeta {
     pub created: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<DateTime<Utc>>,
+    /// Producer-resolved outbound links (the document's `links:` frontmatter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<MetaLink>,
+    /// Producer-resolved, render-ready extra metadata rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<MetaField>,
 }
 
 #[derive(Debug, Clone)]
@@ -714,6 +756,8 @@ mod tests {
                     authors: vec!["octocat".into()],
                     created: DateTime::<Utc>::from_timestamp(1_700_000_100, 0),
                     updated: DateTime::<Utc>::from_timestamp(1_700_000_200, 0),
+                    links: vec![],
+                    fields: vec![],
                 }],
                 spec_changes: vec![
                     SpecChange::Upsert(Spec {

@@ -189,6 +189,12 @@ impl MetadataReader {
         MetadataReadResult { metadata, body }
     }
 
+    /// The configured extra metadata fields, so producers can resolve
+    /// render-ready rows without holding the full [`ProjectConfiguration`].
+    pub fn extra_fields(&self) -> &[ExtraMetadataField] {
+        &self.config.extra_metadata_fields
+    }
+
     pub(crate) fn default_status(&self) -> String {
         self.config
             .default_status
@@ -1157,6 +1163,56 @@ Body
             }
             other => panic!("expected markdown extra metadata, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn rust_rfc_bullet_links_become_markdown_extra_fields() {
+        // The int128 RFC form: title/created via aliases, two link bullets via
+        // extra fields. No `display_name` configured, so the label falls back to
+        // `name` ("RFC PR") — which must be colon-free.
+        let doc = "- Feature Name: int128\n\
+                   - Start Date: 2016-02-21\n\
+                   - RFC PR: [rust-lang/rfcs#1504](https://github.com/rust-lang/rfcs/pull/1504)\n\
+                   - Rust Issue: [rust-lang/rust#35118](https://github.com/rust-lang/rust/issues/35118)\n\n\
+                   ## Summary\n\nBody.\n";
+
+        let mut config = ProjectConfiguration::default();
+        config
+            .field_aliases
+            .insert("title".into(), "Feature Name".into());
+        config
+            .field_aliases
+            .insert("created".into(), "Start Date".into());
+        for name in ["RFC PR", "Rust Issue"] {
+            config.extra_metadata_fields.push(ExtraMetadataField {
+                name: name.into(),
+                type_hint: MetadataValueType::Markdown,
+                required: false,
+                display_name: None,
+                link_format: None,
+                aliases: vec![],
+            });
+        }
+
+        let reader = MetadataReader::new(config);
+        let result = reader.read(doc, DocFormat::Markdown, "fallback");
+
+        assert_eq!(result.metadata.title.as_deref(), Some("int128"));
+        assert_eq!(result.metadata.created.as_deref(), Some("2016-02-21"));
+
+        // Keyed by the configured name — no trailing colon.
+        match result.metadata.extra.get("RFC PR") {
+            Some(MetadataValue::Markdown(html)) => {
+                assert!(
+                    html.contains("href=\"https://github.com/rust-lang/rfcs/pull/1504\""),
+                    "link not preserved: {html}"
+                );
+                assert!(html.contains("rust-lang/rfcs#1504"));
+            }
+            other => panic!("expected markdown extra for RFC PR, got {other:?}"),
+        }
+        assert!(result.metadata.extra.contains_key("Rust Issue"));
+        assert!(result.body.trim_start().starts_with("## Summary"));
     }
 
     #[test]

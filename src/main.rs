@@ -758,6 +758,58 @@ fn display_extra_value(value: &Value) -> String {
     }
 }
 
+/// Resolve a document's outbound `links:` into render-ready wire rows, dropping
+/// entries missing a label or href.
+fn resolve_meta_links(links: &[Link]) -> Vec<dossiers::bundle::MetaLink> {
+    links
+        .iter()
+        .filter(|link| !link.label.trim().is_empty() && !link.href.trim().is_empty())
+        .map(|link| dossiers::bundle::MetaLink {
+            label: link.label.clone(),
+            href: link.href.clone(),
+        })
+        .collect()
+}
+
+/// Resolve the configured extra metadata fields against a spec's `extra` map
+/// into render-ready wire rows. Mirrors the display logic used by the static
+/// site renderer so producers and consumers agree on labels, links, and which
+/// values are pre-rendered HTML.
+fn resolve_meta_fields(
+    extra: &HashMap<String, Value>,
+    fields: &[ExtraMetadataField],
+) -> Vec<dossiers::bundle::MetaField> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            extra.get(&field.name).map(|value| {
+                let label = field
+                    .display_name
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| field.name.clone());
+                let html = field.type_hint == MetadataValueType::Markdown;
+                let href = match (&field.link_format, value, field.type_hint) {
+                    (Some(fmt), Value::String(raw), MetadataValueType::String)
+                        if !raw.is_empty() =>
+                    {
+                        Some(fmt.replace("{value}", &url_escape_component(raw)))
+                    }
+                    _ => None,
+                };
+                dossiers::bundle::MetaField {
+                    label,
+                    value: display_extra_value(value),
+                    href,
+                    html,
+                }
+            })
+        })
+        .filter(|field| !field.value.is_empty())
+        .collect()
+}
+
 fn url_escape_component(raw: &str) -> String {
     const UNRESERVED: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
     let mut encoded = String::new();
@@ -2666,6 +2718,8 @@ fn build_spec_index(
         let Some(doc) = by_id.remove(&spec.id) else {
             continue;
         };
+        let links = resolve_meta_links(&doc.links);
+        let fields = resolve_meta_fields(&doc.extra, &project_config.extra_metadata_fields);
         entries.push(dossiers::bundle::SpecIndexEntry {
             id: spec.id.clone(),
             dir_name: spec.dir_name.clone(),
@@ -2677,6 +2731,8 @@ fn build_spec_index(
             updated: doc.updated.and_then(millis_to_utc),
             authors: doc.authors,
             extra: doc.extra.into_iter().collect(),
+            links,
+            fields,
         });
     }
     Ok(entries)
@@ -3492,6 +3548,10 @@ fn build_pr_change_target(
         },
     ));
 
+    let links = resolve_meta_links(&meta.links);
+    let extra_json = metadata_extra_to_json(&meta.extra);
+    let fields = resolve_meta_fields(&extra_json, metadata_reader.extra_fields());
+
     Ok(Some(BuiltPrTarget {
         spec_changes,
         asset_changes,
@@ -3502,6 +3562,8 @@ fn build_pr_change_target(
             authors,
             created,
             updated,
+            links,
+            fields,
         }),
     }))
 }
@@ -4274,38 +4336,8 @@ fn render_spec(
         )),
         _ => None,
     };
-    let links: Vec<(&str, &str)> = spec
-        .links
-        .iter()
-        .map(|link| (link.label.as_str(), link.href.as_str()))
-        .collect();
-    let extra_pairs = state
-        .extra_fields
-        .iter()
-        .filter_map(|field| {
-            spec.extra.get(&field.name).map(|value| {
-                let label = field
-                    .display_name
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| field.name.clone());
-                let display = display_extra_value(value);
-                let is_html = field.type_hint == MetadataValueType::Markdown;
-                let link = match (&field.link_format, value, field.type_hint) {
-                    (Some(fmt), Value::String(raw), MetadataValueType::String)
-                        if !raw.is_empty() =>
-                    {
-                        let encoded = url_escape_component(raw);
-                        Some(fmt.replace("{value}", &encoded))
-                    }
-                    _ => None,
-                };
-                (label, display, link, is_html)
-            })
-        })
-        .filter(|(_, v, _, _)| !v.is_empty())
-        .collect::<Vec<_>>();
+    let links = resolve_meta_links(&spec.links);
+    let extra_pairs = resolve_meta_fields(&spec.extra, &state.extra_fields);
     let revisions = state.revisions.get(&base_id);
     let is_pr_page = spec.pr_number.is_some();
     let original_link = spec.revision_of.as_ref().map(|id| {
@@ -4378,23 +4410,23 @@ fn render_spec(
                 div class="spec-header" {
                     span class="meta-label" { "Links" }
                     span {
-                        @for (index, (label, href)) in links.iter().enumerate() {
+                        @for (index, link) in links.iter().enumerate() {
                             @if index > 0 { span class="meta-divider" { "•" } }
-                            a class="spec-metadata-link" href=(*href) target="_blank" rel="noreferrer noopener" { (label) }
+                            a class="spec-metadata-link" href=(link.href) target="_blank" rel="noreferrer noopener" { (link.label) }
                         }
                     }
                 }
             }
 
-            @for (key, value, link, is_html) in extra_pairs {
+            @for field in &extra_pairs {
                 div class="spec-header" {
-                    span class="meta-label" { (key) }
-                    @if let Some(href) = link {
-                        a class="spec-metadata-link meta-value" href=(href) target="_blank" rel="noreferrer noopener" { (value) }
-                    } @else if is_html {
-                        div class="meta-value meta-value--markdown" { (PreEscaped(value)) }
+                    span class="meta-label" { (field.label) }
+                    @if let Some(href) = &field.href {
+                        a class="spec-metadata-link meta-value" href=(href) target="_blank" rel="noreferrer noopener" { (field.value) }
+                    } @else if field.html {
+                        div class="meta-value meta-value--markdown" { (PreEscaped(&field.value)) }
                     } @else {
-                        span class="meta-value" { (value) }
+                        span class="meta-value" { (field.value) }
                     }
                 }
             }
