@@ -1876,14 +1876,15 @@ fn fetch_sync_state(
 /// same way PR gathering does. Empty when PRs would be skipped anyway (no
 /// `GITHUB_TOKEN` / no repo) or on failure — matching what a full push carries.
 fn open_pull_heads(
-    project_root: &Path,
+    spec_root: &Path,
     project_config: &ProjectConfiguration,
 ) -> HashMap<u64, String> {
     let token = match env::var("GITHUB_TOKEN") {
         Ok(value) if !value.trim().is_empty() => value,
         _ => return HashMap::new(),
     };
-    let git_repo = open_git_repository(project_root);
+    // Discover from the spec directory (inside the repo), matching PR gathering.
+    let git_repo = open_git_repository(spec_root);
     let repo_from_config = project_config
         .repository
         .as_deref()
@@ -1915,9 +1916,9 @@ enum DeltaOutcome {
     Pushed(PushSyncResponse),
     /// Nothing changed since the last sync — no push needed.
     UpToDate,
-    /// A delta wasn't possible (first sync, old server, base lost, config
-    /// change, oversize, or a 409 base mismatch); do a full sync instead.
-    Fallback,
+    /// A delta wasn't possible; the `String` says why (shown to the user), and
+    /// the caller does a full sync instead.
+    Fallback(String),
 }
 
 /// Try to push only what changed since the server's last-synced ref for this
@@ -1939,17 +1940,17 @@ fn try_delta_push(
     no_prs: bool,
     timeout_secs: u64,
 ) -> Result<DeltaOutcome> {
-    // The state fetch is also the delta-capability probe: an older server
-    // (or none) has no `pr_heads`, so fall back to a full snapshot.
-    let Some(state) = fetch_sync_state(client, api_url, project, token) else {
-        return Ok(DeltaOutcome::Fallback);
-    };
-    let Some(server_pr_heads) = state.pr_heads else {
-        return Ok(DeltaOutcome::Fallback);
-    };
-
-    let Some(repo) = open_git_repository(project_root) else {
-        return Ok(DeltaOutcome::Fallback);
+    // Cheap local checks first, before any network round-trip. Discover git
+    // from the spec directory (inside the repo), not `project_root` — with an
+    // explicit `-c config.toml` the project root is the config's parent, which
+    // can sit outside the repo (e.g. specs in `examples/react`, config in
+    // `examples/`). `Repository::discover` walks up from the spec path.
+    let resolved_input = resolve_spec_input_path(input_path, project_config);
+    let Some(repo) = open_git_repository(&resolved_input) else {
+        return Ok(DeltaOutcome::Fallback(format!(
+            "not a git repository at {}",
+            resolved_input.display()
+        )));
     };
     let resolved_branch = branch
         .map(str::to_string)
@@ -1960,26 +1961,54 @@ fn try_delta_push(
         .or_else(|| repo.head_commit_sha())
         .unwrap_or_default();
     if resolved_branch.is_empty() || resolved_commit.is_empty() {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(
+            "could not resolve the current git branch/commit".into(),
+        ));
     }
+
+    // The state fetch is also the delta-capability probe: an older server
+    // (or none) has no `pr_heads`, so fall back to a full snapshot.
+    let Some(state) = fetch_sync_state(client, api_url, project, token) else {
+        return Ok(DeltaOutcome::Fallback(
+            "could not read server sync state (older server or network error)".into(),
+        ));
+    };
+    let Some(server_pr_heads) = state.pr_heads else {
+        return Ok(DeltaOutcome::Fallback(
+            "server does not support incremental sync".into(),
+        ));
+    };
 
     // The delta base is the server's last-synced commit for this branch. Absent
     // (never synced) or lost from local history (force-push / shallow clone) →
     // full sync.
     let Some(base) = state.branches.get(&resolved_branch).cloned() else {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(format!(
+            "no previously-synced ref for branch '{resolved_branch}' (server knows: [{}])",
+            state
+                .branches
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     };
     if !repo.has_commit(&base) {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(format!(
+            "base commit {base} is not in local history (shallow clone? fetch more depth)"
+        )));
     }
 
-    let resolved_input = resolve_spec_input_path(input_path, project_config);
     let Some(changed) = repo.changed_paths_since(&base) else {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(
+            "could not diff against the base commit".into(),
+        ));
     };
     let workdir = repo.workdir();
     let Some(spec_rel) = relative_to(&resolved_input, workdir) else {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(
+            "spec directory is outside the git repository".into(),
+        ));
     };
     // A change to the project config can affect every spec's derived metadata,
     // so it isn't expressible as a per-spec delta — force a full sync.
@@ -1989,7 +2018,9 @@ fn try_delta_push(
     let mut touched: HashSet<String> = HashSet::new();
     for path in &changed {
         if config_rel.as_deref() == Some(path.as_path()) {
-            return Ok(DeltaOutcome::Fallback);
+            return Ok(DeltaOutcome::Fallback(
+                "project config changed (affects all specs)".into(),
+            ));
         }
         if let Ok(rest) = path.strip_prefix(&spec_rel) {
             if let Some(first) = rest.components().next() {
@@ -2028,7 +2059,7 @@ fn try_delta_push(
             server_pr_heads.keys().copied().collect::<Vec<_>>(),
         )
     } else {
-        let open_heads = open_pull_heads(project_root, project_config);
+        let open_heads = open_pull_heads(&resolved_input, project_config);
         let deleted: Vec<u64> = server_pr_heads
             .keys()
             .filter(|n| !open_heads.contains_key(n))
@@ -2095,7 +2126,10 @@ fn try_delta_push(
     // A delta big enough to exceed the single-request limit is rare; rather than
     // chunk a delta (which the server doesn't apply), fall back to a full sync.
     if zip_bytes.len() > SINGLE_SHOT_MAX_BYTES {
-        return Ok(DeltaOutcome::Fallback);
+        return Ok(DeltaOutcome::Fallback(format!(
+            "delta ({} bytes) exceeds the single-request limit",
+            zip_bytes.len()
+        )));
     }
 
     let sync_url = format!("{api_url}/api/v1/projects/{project}/sync");
@@ -2111,10 +2145,9 @@ fn try_delta_push(
 
     match post_delta(client, &sync_url, token, zip_bytes, timeout_secs)? {
         Some(resp) => Ok(DeltaOutcome::Pushed(resp)),
-        None => {
-            eprintln!("Server rejected the delta (sync base out of date); doing a full sync.");
-            Ok(DeltaOutcome::Fallback)
-        }
+        None => Ok(DeltaOutcome::Fallback(
+            "server rejected the delta (sync base out of date)".into(),
+        )),
     }
 }
 
@@ -2253,7 +2286,9 @@ fn run_push(
                 );
                 return Ok(());
             }
-            DeltaOutcome::Fallback => {}
+            DeltaOutcome::Fallback(reason) => {
+                eprintln!("Incremental sync unavailable ({reason}); doing a full sync.");
+            }
         }
     }
 
@@ -2546,7 +2581,13 @@ fn build_package(
     commit: Option<String>,
     no_prs: bool,
 ) -> Result<(dossiers::bundle::Package, Vec<u8>)> {
-    let git_repo = open_git_repository(project_root);
+    // Discover the git repo from the spec directory, not `project_root`: with an
+    // explicit `-c config.toml` the project root is the config's parent, which
+    // can sit outside the repo (e.g. specs in `examples/react`, config in
+    // `examples/`). `Repository::discover` walks up, so the spec path finds the
+    // repo whether specs are at its root or in a subdirectory.
+    let resolved_input = resolve_spec_input_path(input_path, project_config);
+    let git_repo = open_git_repository(&resolved_input);
     let resolved_branch = branch
         .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
         .unwrap_or_default();
@@ -2554,7 +2595,6 @@ fn build_package(
         .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
         .unwrap_or_default();
 
-    let resolved_input = resolve_spec_input_path(input_path, project_config);
     let mainline = dossiers::bundle::Package::mainline_from_directory(&resolved_input)
         .with_context(|| format!("scanning specs at {}", resolved_input.display()))?;
     if mainline.specs.is_empty() {
@@ -3128,7 +3168,9 @@ fn gather_pr_changes_for_package(
         }
     };
 
-    let git_repo = open_git_repository(project_root);
+    // Discover from the spec directory (inside the repo), not `project_root`,
+    // which can be the `-c` config's parent and sit outside the repo.
+    let git_repo = open_git_repository(spec_root);
     let repo_root = git_repo
         .as_ref()
         .map(|repo| repo.workdir().to_path_buf())
