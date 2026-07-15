@@ -5,7 +5,7 @@ use std::env;
 use std::fmt::Write;
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod metadata;
 
@@ -1241,6 +1241,11 @@ enum CliCommand {
         #[arg(long = "no-prs")]
         no_prs: bool,
 
+        /// Abort if the server does not respond within this many seconds; 0
+        /// disables the limit [default: $DOSSIERS_TIMEOUT or 300]
+        #[arg(long = "timeout", value_name = "SECONDS")]
+        timeout: Option<u64>,
+
         /// Assemble and print the package without transmitting it
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -1315,6 +1320,7 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
             branch,
             commit,
             no_prs,
+            timeout,
             dry_run,
         } => {
             let input_path = resolve_input(path)?;
@@ -1328,6 +1334,7 @@ async fn run_command(command: CliCommand, config_path: Option<PathBuf>) -> Resul
                     branch,
                     commit,
                     no_prs,
+                    timeout,
                     dry_run,
                 )
             })
@@ -1823,6 +1830,7 @@ fn run_push(
     branch: Option<String>,
     commit: Option<String>,
     _no_prs: bool,
+    timeout: Option<u64>,
     dry_run: bool,
 ) -> Result<()> {
     let project_root = project_root_from(config_path.as_deref(), &input_path);
@@ -1890,16 +1898,41 @@ fn run_push(
     );
     println!("Pushing to {url}");
 
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("building HTTP client")?;
+    // Bound the request so a stalled or unresponsive server fails with a clear
+    // message instead of hanging forever. `--timeout 0` (or DOSSIERS_TIMEOUT=0)
+    // disables the overall limit for very large pushes on slow links.
+    let timeout_secs = timeout
+        .or_else(|| {
+            env::var("DOSSIERS_TIMEOUT")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(300);
+
+    let mut builder = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(30));
+    if timeout_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    }
+    let client = builder.build().context("building HTTP client")?;
+
     let response = client
         .post(&url)
         .bearer_auth(token_resolved.as_deref().unwrap_or(""))
         .header(reqwest::header::CONTENT_TYPE, "application/zip")
         .body(zip_bytes)
         .send()
-        .with_context(|| format!("sending sync request to {url}"))?;
+        .map_err(|err| {
+            if err.is_timeout() {
+                anyhow!(
+                    "push to {url} timed out after {timeout_secs}s. The server may still be \
+                     processing a large package; retry, raise --timeout, or check the server."
+                )
+            } else if err.is_connect() {
+                anyhow!("could not connect to {url}: {err}")
+            } else {
+                anyhow::Error::new(err).context(format!("sending sync request to {url}"))
+            }
+        })?;
 
     let status = response.status();
     if !status.is_success() {
