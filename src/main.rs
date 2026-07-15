@@ -791,10 +791,16 @@ fn resolve_meta_fields(
                     .unwrap_or_else(|| field.name.clone());
                 let html = field.type_hint == MetadataValueType::Markdown;
                 let href = match (&field.link_format, value, field.type_hint) {
+                    // `link_format` builds a URL from a bare value (e.g. an id),
+                    // so the value is percent-encoded into the template.
                     (Some(fmt), Value::String(raw), MetadataValueType::String)
                         if !raw.is_empty() =>
                     {
                         Some(fmt.replace("{value}", &url_escape_component(raw)))
+                    }
+                    // A `url`-typed value is already a full URL — link to it verbatim.
+                    (_, Value::String(raw), MetadataValueType::Url) if !raw.is_empty() => {
+                        Some(raw.clone())
                     }
                     _ => None,
                 };
@@ -6753,6 +6759,75 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolve_meta_fields_covers_markdown_url_and_link_format() {
+        let fields = vec![
+            ExtraMetadataField {
+                name: "RFC PR".into(),
+                type_hint: MetadataValueType::Markdown,
+                required: false,
+                display_name: None,
+                link_format: None,
+                aliases: vec![],
+            },
+            ExtraMetadataField {
+                name: "React Issue".into(),
+                type_hint: MetadataValueType::Url,
+                required: false,
+                display_name: None,
+                link_format: None,
+                aliases: vec![],
+            },
+            ExtraMetadataField {
+                name: "Tracking".into(),
+                type_hint: MetadataValueType::String,
+                required: false,
+                display_name: Some("Issue".into()),
+                link_format: Some("https://bugs.example/{value}".into()),
+                aliases: vec![],
+            },
+        ];
+        let mut extra: HashMap<String, Value> = HashMap::new();
+        extra.insert(
+            "RFC PR".into(),
+            Value::String("<p><a href=\"https://x/1\">rfc#1</a></p>".into()),
+        );
+        extra.insert(
+            "React Issue".into(),
+            Value::String("https://github.com/facebook/react/issues/7678".into()),
+        );
+        extra.insert("Tracking".into(), Value::String("PROJ 12".into()));
+
+        let resolved = resolve_meta_fields(&extra, &fields);
+        let by_label = |label: &str| {
+            resolved
+                .iter()
+                .find(|f| f.label == label)
+                .unwrap_or_else(|| panic!("missing field {label}"))
+                .clone()
+        };
+
+        // Markdown: pre-rendered HTML, no href.
+        let md = by_label("RFC PR");
+        assert!(md.html);
+        assert!(md.href.is_none());
+        assert!(md.value.contains("<a href=\"https://x/1\">"));
+
+        // Url: linked to itself, verbatim (no percent-encoding), not HTML.
+        let url = by_label("React Issue");
+        assert!(!url.html);
+        assert_eq!(
+            url.href.as_deref(),
+            Some("https://github.com/facebook/react/issues/7678")
+        );
+        assert_eq!(url.value, "https://github.com/facebook/react/issues/7678");
+
+        // link_format: value substituted (and percent-encoded) into the template.
+        let lf = by_label("Issue");
+        assert_eq!(lf.href.as_deref(), Some("https://bugs.example/PROJ%2012"));
+        assert_eq!(lf.value, "PROJ 12");
+    }
 
     #[test]
     fn renders_basic_asciidoc() {

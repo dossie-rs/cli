@@ -83,6 +83,9 @@ pub enum MetadataValueType {
     Boolean,
     Date,
     Markdown,
+    /// A bare URL. Stored verbatim and rendered as a link to itself — for
+    /// metadata whose value is already a full URL (e.g. React RFCs' `RFC PR`).
+    Url,
 }
 
 #[allow(dead_code)]
@@ -929,7 +932,7 @@ fn yaml_value_to_string(value: &YamlValue) -> Option<String> {
 
 fn parse_typed_yaml_value(value: &YamlValue, kind: MetadataValueType) -> Option<MetadataValue> {
     match kind {
-        MetadataValueType::String | MetadataValueType::Date => {
+        MetadataValueType::String | MetadataValueType::Date | MetadataValueType::Url => {
             yaml_value_to_string(value).map(MetadataValue::String)
         }
         MetadataValueType::Boolean => value.as_bool().map(MetadataValue::Boolean),
@@ -949,7 +952,7 @@ fn parse_typed_str_value(value: &str, kind: MetadataValueType) -> Option<Metadat
     }
 
     match kind {
-        MetadataValueType::String | MetadataValueType::Date => {
+        MetadataValueType::String | MetadataValueType::Date | MetadataValueType::Url => {
             Some(MetadataValue::String(trimmed.to_string()))
         }
         MetadataValueType::Boolean => match trimmed.to_ascii_lowercase().as_str() {
