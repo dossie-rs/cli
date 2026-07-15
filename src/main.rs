@@ -1808,7 +1808,7 @@ fn run_build(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct PushSyncResponse {
     #[serde(default)]
     synced: usize,
@@ -1818,6 +1818,130 @@ struct PushSyncResponse {
     updated: usize,
     #[serde(default)]
     deleted: usize,
+    #[serde(default)]
+    pr_revisions: usize,
+}
+
+impl std::ops::AddAssign for PushSyncResponse {
+    fn add_assign(&mut self, rhs: Self) {
+        self.synced += rhs.synced;
+        self.created += rhs.created;
+        self.updated += rhs.updated;
+        self.deleted += rhs.deleted;
+        self.pr_revisions += rhs.pr_revisions;
+    }
+}
+
+/// The server's last-synced ref per branch, from `GET .../sync/state`.
+#[derive(Debug, Default, Deserialize)]
+struct SyncStateResponse {
+    #[serde(default)]
+    branches: HashMap<String, String>,
+}
+
+/// The branch → commit map the current working state would push: the mainline
+/// branch (resolved exactly as `build_package` does) plus every open PR's head
+/// commit. It mirrors what the server records on a successful sync, so an equal
+/// map means nothing has changed since last time and the push can be skipped.
+fn current_branch_refs(
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+    branch: Option<&str>,
+    commit: Option<&str>,
+    no_prs: bool,
+) -> HashMap<String, String> {
+    let mut refs = HashMap::new();
+
+    let git_repo = open_git_repository(project_root);
+    let resolved_branch = branch
+        .map(str::to_string)
+        .or_else(|| git_repo.as_ref().and_then(|r| r.current_branch()))
+        .unwrap_or_default();
+    let resolved_commit = commit
+        .map(str::to_string)
+        .or_else(|| git_repo.as_ref().and_then(|r| r.head_commit_sha()))
+        .unwrap_or_default();
+    // The server records the mainline branch only when both are known.
+    if !resolved_branch.is_empty() && !resolved_commit.is_empty() {
+        refs.insert(resolved_branch, resolved_commit);
+    }
+
+    if !no_prs {
+        for (branch, head_sha) in open_pr_branch_refs(project_root, project_config) {
+            refs.insert(branch, head_sha);
+        }
+    }
+
+    refs
+}
+
+/// `(branch, head_sha)` for every open PR, using the same branch fallback as
+/// `build_package`. Empty on any failure, or when PR gathering would be skipped
+/// anyway (no `GITHUB_TOKEN`, no GitHub repo) — the same conditions under which
+/// a real push carries no PR changes, so the comparison stays consistent.
+///
+/// This lists all open PRs (a cheap metadata call) rather than the subset that
+/// touch specs, so it may include extra branches the server never stored. That
+/// only ever suppresses a skip (forcing a harmless full sync); it never causes a
+/// skip when something changed, because a changed/opened/closed PR always makes
+/// the maps differ.
+fn open_pr_branch_refs(
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+) -> Vec<(String, String)> {
+    let token = match env::var("GITHUB_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Vec::new(),
+    };
+    let git_repo = open_git_repository(project_root);
+    let repo_from_config = project_config
+        .repository
+        .as_deref()
+        .and_then(parse_github_repo);
+    let repo_from_git = git_repo
+        .as_ref()
+        .and_then(|repo| repo.remote_url())
+        .as_deref()
+        .and_then(parse_github_repo);
+    let Some(github_repo) = repo_from_config.or(repo_from_git) else {
+        return Vec::new();
+    };
+    let Ok(client) = GithubClient::new(github_repo, &token) else {
+        return Vec::new();
+    };
+    let Ok(pulls) = client.list_open_pulls() else {
+        return Vec::new();
+    };
+    pulls
+        .into_iter()
+        .filter(|pull| !pull.head_sha.is_empty())
+        .map(|pull| {
+            let branch = if pull.head_ref.is_empty() {
+                format!("pull/{}", pull.number)
+            } else {
+                pull.head_ref
+            };
+            (branch, pull.head_sha)
+        })
+        .collect()
+}
+
+/// Fetch the server's last-synced branch → commit map. Returns `None` on any
+/// error — offline, auth failure, or an older server without the endpoint — so
+/// the caller falls back to a normal full sync.
+fn fetch_sync_state(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    project: &str,
+    token: &str,
+) -> Option<HashMap<String, String>> {
+    let url = format!("{api_url}/api/v1/projects/{project}/sync/state");
+    let response = client.get(&url).bearer_auth(token).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let parsed: SyncStateResponse = response.json().ok()?;
+    Some(parsed.branches)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1829,7 +1953,7 @@ fn run_push(
     token: Option<String>,
     branch: Option<String>,
     commit: Option<String>,
-    _no_prs: bool,
+    no_prs: bool,
     timeout: Option<u64>,
     dry_run: bool,
 ) -> Result<()> {
@@ -1864,6 +1988,49 @@ fn run_push(
         bail!("project token is required (use --token or $DOSSIERS_TOKEN)");
     }
 
+    // Bound the request so a stalled or unresponsive server fails with a clear
+    // message instead of hanging forever. `--timeout 0` (or DOSSIERS_TIMEOUT=0)
+    // disables the overall limit for very large pushes on slow links.
+    let timeout_secs = timeout
+        .or_else(|| {
+            env::var("DOSSIERS_TIMEOUT")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(300);
+    let mut builder = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(30));
+    if timeout_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    }
+    let client = builder.build().context("building HTTP client")?;
+
+    // Pre-flight: skip the whole scan / bundle / upload when the server already
+    // holds the exact branch → commit state this push would produce — the
+    // mainline HEAD plus every open PR head. Best-effort: any error, or an older
+    // server without the /sync/state endpoint, falls through to a full sync.
+    if !dry_run {
+        let token = token_resolved.as_deref().unwrap_or("");
+        let current = current_branch_refs(
+            &project_root,
+            &project_config,
+            branch.as_deref(),
+            commit.as_deref(),
+            no_prs,
+        );
+        if !current.is_empty() {
+            if let Some(server) =
+                fetch_sync_state(&client, &api_url_trimmed, &project_resolved, token)
+            {
+                if current == server {
+                    println!(
+                        "Nothing to sync: the current branch and open PRs already match the last sync."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let (package, zip_bytes) = build_package(
         &input_path,
         &project_root,
@@ -1871,13 +2038,15 @@ fn run_push(
         config_path.as_deref(),
         branch,
         commit,
+        no_prs,
     )?;
 
     let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
     println!(
-        "Packaged {} spec(s) with {} binary asset(s) ({} bytes)",
+        "Packaged {} spec(s) with {} binary asset(s){} ({} bytes)",
         package.mainline.specs.len(),
         total_assets,
+        pr_summary(&package.pr_changes),
         zip_bytes.len()
     );
 
@@ -1891,46 +2060,100 @@ fn run_push(
         return Ok(());
     }
 
-    let url = format!(
+    let sync_url = format!(
         "{api_url}/api/v1/projects/{project}/sync",
         api_url = api_url_trimmed,
         project = project_resolved
     );
-    println!("Pushing to {url}");
+    println!("Pushing to {sync_url}");
 
-    // Bound the request so a stalled or unresponsive server fails with a clear
-    // message instead of hanging forever. `--timeout 0` (or DOSSIERS_TIMEOUT=0)
-    // disables the overall limit for very large pushes on slow links.
-    let timeout_secs = timeout
-        .or_else(|| {
-            env::var("DOSSIERS_TIMEOUT")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(300);
+    let token = token_resolved.as_deref().unwrap_or("");
 
-    let mut builder = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(30));
-    if timeout_secs > 0 {
-        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    if zip_bytes.len() <= SINGLE_SHOT_MAX_BYTES {
+        // Small enough for one request: push the whole snapshot as before.
+        let parsed = post_sync(&client, &sync_url, token, zip_bytes, "", timeout_secs)?;
+        println!(
+            "Synced {} spec(s): {} created, {} updated, {} deleted",
+            parsed.synced, parsed.created, parsed.updated, parsed.deleted
+        );
+    } else {
+        // Too large for the platform's request-body limit: split into chunks
+        // that share one run id, and let the final request prune stale rows.
+        let chunks = split_package(package, MAX_CHUNK_RAW_BYTES);
+        let total = chunks.len();
+        println!(
+            "Package exceeds the single-request limit ({} bytes); pushing in {} chunk(s).",
+            zip_bytes.len(),
+            total
+        );
+        let run_id = format!(
+            "run-{}-{}",
+            Utc::now().timestamp_millis(),
+            std::process::id()
+        );
+        let mut summary = PushSyncResponse::default();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let is_final = i + 1 == total;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            chunk
+                .write_zip(&mut buf)
+                .context("encoding chunk package")?;
+            let bytes = buf.into_inner();
+            eprintln!(
+                "  chunk {}/{} ({} bytes){}",
+                i + 1,
+                total,
+                bytes.len(),
+                if is_final { " [final]" } else { "" }
+            );
+            let query = format!("?run_id={run_id}&final={is_final}");
+            summary += post_sync(&client, &sync_url, token, bytes, &query, timeout_secs)?;
+        }
+        println!(
+            "Synced {} spec(s) across {} chunk(s): {} created, {} updated, {} deleted",
+            summary.synced, total, summary.created, summary.updated, summary.deleted
+        );
     }
-    let client = builder.build().context("building HTTP client")?;
 
+    Ok(())
+}
+
+/// Full-package size (compressed zip bytes) at or below which a push is sent as
+/// a single request. Above this the package is chunked to stay under the
+/// serverless request-body limit (Vercel caps function payloads at ~4.5 MB).
+const SINGLE_SHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Target raw (uncompressed) content per chunk. Kept well under the request
+/// limit so even incompressible (binary) chunks fit once zipped.
+const MAX_CHUNK_RAW_BYTES: usize = 3 * 1024 * 1024;
+
+/// POST one package zip to the sync endpoint (optionally with chunk query
+/// params) and parse the response.
+fn post_sync(
+    client: &reqwest::blocking::Client,
+    sync_url: &str,
+    token: &str,
+    zip_bytes: Vec<u8>,
+    query: &str,
+    timeout_secs: u64,
+) -> Result<PushSyncResponse> {
+    let url = format!("{sync_url}{query}");
     let response = client
         .post(&url)
-        .bearer_auth(token_resolved.as_deref().unwrap_or(""))
+        .bearer_auth(token)
         .header(reqwest::header::CONTENT_TYPE, "application/zip")
         .body(zip_bytes)
         .send()
         .map_err(|err| {
             if err.is_timeout() {
                 anyhow!(
-                    "push to {url} timed out after {timeout_secs}s. The server may still be \
+                    "push to {sync_url} timed out after {timeout_secs}s. The server may still be \
                      processing a large package; retry, raise --timeout, or check the server."
                 )
             } else if err.is_connect() {
-                anyhow!("could not connect to {url}: {err}")
+                anyhow!("could not connect to {sync_url}: {err}")
             } else {
-                anyhow::Error::new(err).context(format!("sending sync request to {url}"))
+                anyhow::Error::new(err).context(format!("sending sync request to {sync_url}"))
             }
         })?;
 
@@ -1947,13 +2170,109 @@ fn run_push(
         );
     }
 
-    let parsed: PushSyncResponse = response.json().context("parsing sync response")?;
-    println!(
-        "Synced {} spec(s): {} created, {} updated, {} deleted",
-        parsed.synced, parsed.created, parsed.updated, parsed.deleted
-    );
+    response.json().context("parsing sync response")
+}
 
-    Ok(())
+/// Split a package into chunks whose raw content stays within `max_chunk_raw`,
+/// so each serialises to a request small enough for the server's body limit.
+/// Mainline specs and PR change-sets are packed together; each chunk keeps only
+/// the manifest index entries for the mainline specs it carries.
+fn split_package(
+    package: dossiers::bundle::Package,
+    max_chunk_raw: usize,
+) -> Vec<dossiers::bundle::Package> {
+    use dossiers::bundle::{Mainline, Manifest, Package, PrChangeSet, Spec, SpecIndexEntry};
+
+    let index_by_id: HashMap<String, SpecIndexEntry> = package
+        .manifest
+        .specs
+        .iter()
+        .cloned()
+        .map(|e| (e.id.clone(), e))
+        .collect();
+    let mut manifest_template = package.manifest.clone();
+    manifest_template.specs = Vec::new();
+    let project_config = package.project_config.clone();
+
+    enum Item {
+        Spec(Spec),
+        Pr(PrChangeSet),
+    }
+    let mut items: Vec<(usize, Item)> = Vec::new();
+    for spec in package.mainline.specs {
+        let size = spec.source.len() + spec.assets.iter().map(|a| a.bytes.len()).sum::<usize>();
+        items.push((size, Item::Spec(spec)));
+    }
+    for pr in package.pr_changes {
+        items.push((pr_change_raw_size(&pr), Item::Pr(pr)));
+    }
+
+    // Greedy bin-packing: start a new chunk once adding an item would overflow
+    // the current one. A single oversized item still ships alone.
+    let mut chunks: Vec<(Vec<Spec>, Vec<PrChangeSet>)> = Vec::new();
+    let mut specs: Vec<Spec> = Vec::new();
+    let mut prs: Vec<PrChangeSet> = Vec::new();
+    let mut size = 0usize;
+    for (item_size, item) in items {
+        if size > 0 && size + item_size > max_chunk_raw {
+            chunks.push((std::mem::take(&mut specs), std::mem::take(&mut prs)));
+            size = 0;
+        }
+        match item {
+            Item::Spec(s) => specs.push(s),
+            Item::Pr(p) => prs.push(p),
+        }
+        size += item_size;
+    }
+    if !specs.is_empty() || !prs.is_empty() {
+        chunks.push((specs, prs));
+    }
+    if chunks.is_empty() {
+        chunks.push((Vec::new(), Vec::new()));
+    }
+
+    chunks
+        .into_iter()
+        .map(|(specs, pr_changes)| {
+            let chunk_index: Vec<SpecIndexEntry> = specs
+                .iter()
+                .filter_map(|s| index_by_id.get(&s.id).cloned())
+                .collect();
+            Package {
+                manifest: Manifest {
+                    specs: chunk_index,
+                    ..manifest_template.clone()
+                },
+                project_config: project_config.clone(),
+                mainline: Mainline { specs },
+                pr_changes,
+            }
+        })
+        .collect()
+}
+
+/// Raw byte size of a PR change-set's upserted content (sources + assets).
+fn pr_change_raw_size(pr: &dossiers::bundle::PrChangeSet) -> usize {
+    use dossiers::bundle::{AssetChange, SpecChange};
+    let specs: usize = pr
+        .spec_changes
+        .iter()
+        .map(|c| match c {
+            SpecChange::Upsert(spec) => {
+                spec.source.len() + spec.assets.iter().map(|a| a.bytes.len()).sum::<usize>()
+            }
+            SpecChange::Remove { .. } => 0,
+        })
+        .sum();
+    let assets: usize = pr
+        .asset_changes
+        .iter()
+        .map(|c| match c {
+            AssetChange::Upsert { asset, .. } => asset.bytes.len(),
+            AssetChange::Remove { .. } => 0,
+        })
+        .sum();
+    specs + assets
 }
 
 fn run_bundle(
@@ -1973,15 +2292,17 @@ fn run_bundle(
         config_path.as_deref(),
         branch,
         commit,
+        false,
     )?;
 
     let total_assets: usize = package.mainline.specs.iter().map(|s| s.assets.len()).sum();
     fs::write(&output, &zip_bytes)
         .with_context(|| format!("writing bundle to {}", output.display()))?;
     println!(
-        "Bundled {} spec(s) with {} binary asset(s) ({} bytes) to {}",
+        "Bundled {} spec(s) with {} binary asset(s){} ({} bytes) to {}",
         package.mainline.specs.len(),
         total_assets,
+        pr_summary(&package.pr_changes),
         zip_bytes.len(),
         output.display()
     );
@@ -1989,6 +2310,7 @@ fn run_bundle(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_package(
     input_path: &Path,
     project_root: &Path,
@@ -1996,6 +2318,7 @@ fn build_package(
     config_path: Option<&Path>,
     branch: Option<String>,
     commit: Option<String>,
+    no_prs: bool,
 ) -> Result<(dossiers::bundle::Package, Vec<u8>)> {
     let git_repo = open_git_repository(project_root);
     let resolved_branch = branch
@@ -2017,6 +2340,17 @@ fn build_package(
 
     let specs_index = build_spec_index(&resolved_input, project_config, &mainline)?;
 
+    let pr_changes = if no_prs {
+        Vec::new()
+    } else {
+        gather_pr_changes_for_package(project_root, project_config, &resolved_input).unwrap_or_else(
+            |err| {
+                eprintln!("Warning: failed to gather PR revisions: {err}");
+                Vec::new()
+            },
+        )
+    };
+
     let package = dossiers::bundle::Package {
         manifest: dossiers::bundle::Manifest {
             package_version: dossiers::bundle::PACKAGE_VERSION,
@@ -2028,7 +2362,7 @@ fn build_package(
         },
         project_config: project_config_bytes,
         mainline,
-        pr_changes: Vec::new(),
+        pr_changes,
     };
 
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -2075,6 +2409,19 @@ fn build_spec_index(
 
 fn millis_to_utc(ms: i64) -> Option<chrono::DateTime<Utc>> {
     chrono::Utc.timestamp_millis_opt(ms).single()
+}
+
+/// A `", N open PR(s)"` fragment for push/bundle output, or empty when none.
+fn pr_summary(pr_changes: &[dossiers::bundle::PrChangeSet]) -> String {
+    if pr_changes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", {} open PR{}",
+            pr_changes.len(),
+            if pr_changes.len() == 1 { "" } else { "s" }
+        )
+    }
 }
 
 fn empty_to_none(s: String) -> Option<String> {
@@ -2515,6 +2862,462 @@ fn build_pr_spec_version(
     }
 
     Ok(())
+}
+
+/// Result of turning one PR target spec into wire-format changes.
+struct BuiltPrTarget {
+    spec_changes: Vec<dossiers::bundle::SpecChange>,
+    asset_changes: Vec<dossiers::bundle::AssetChange>,
+    meta: Option<dossiers::bundle::PrSpecMeta>,
+}
+
+/// Assemble sparse PR change-sets for a package. Discovers open PRs, maps their
+/// changed files to specs, and downloads the PR's version of each changed file
+/// so the server can render a preview. Mirrors the discovery in
+/// [`augment_with_pull_requests`] but emits wire-format change-sets instead of
+/// in-memory preview specs. Requires `GITHUB_TOKEN`; returns an empty vec (with
+/// a note on stderr) when PRs can't be fetched.
+fn gather_pr_changes_for_package(
+    project_root: &Path,
+    project_config: &ProjectConfiguration,
+    spec_root: &Path,
+) -> Result<Vec<dossiers::bundle::PrChangeSet>> {
+    let token = match env::var("GITHUB_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("Skipping PR revisions: GITHUB_TOKEN not set.");
+            return Ok(Vec::new());
+        }
+    };
+
+    let git_repo = open_git_repository(project_root);
+    let repo_root = git_repo
+        .as_ref()
+        .map(|repo| repo.workdir().to_path_buf())
+        .unwrap_or_else(|| project_root.to_path_buf());
+
+    let repo_from_config = project_config
+        .repository
+        .as_deref()
+        .and_then(parse_github_repo);
+    let repo_from_git = git_repo
+        .as_ref()
+        .and_then(|repo| repo.remote_url())
+        .as_deref()
+        .and_then(parse_github_repo);
+    let Some(github_repo) = repo_from_config.or(repo_from_git) else {
+        eprintln!("Skipping PR revisions: no GitHub repository found in config or git remotes.");
+        return Ok(Vec::new());
+    };
+    let repo_slug = format!("{}/{}", github_repo.owner, github_repo.name);
+
+    let Some(spec_root_relative) = relative_to(spec_root, &repo_root) else {
+        eprintln!(
+            "Skipping PR revisions: unable to relate spec root {} to repository root {}.",
+            spec_root.display(),
+            repo_root.display()
+        );
+        return Ok(Vec::new());
+    };
+
+    eprintln!("Using GitHub repository {repo_slug} for PR revisions.");
+    let client = GithubClient::new(github_repo, &token)
+        .context("creating GitHub client for pull request change-sets")?;
+    let metadata_reader = MetadataReader::new(project_config.clone());
+
+    gather_pr_changes(
+        &client,
+        &metadata_reader,
+        spec_root,
+        &spec_root_relative,
+        project_config.pr_number_as_spec_id,
+        &repo_slug,
+    )
+}
+
+fn gather_pr_changes(
+    client: &GithubClient,
+    metadata_reader: &MetadataReader,
+    spec_root: &Path,
+    spec_root_relative: &Path,
+    pr_number_as_spec_id: bool,
+    repo_slug: &str,
+) -> Result<Vec<dossiers::bundle::PrChangeSet>> {
+    let pulls = client
+        .list_open_pulls()
+        .context("listing open GitHub pull requests")?;
+    if pulls.is_empty() {
+        eprintln!("No open pull requests found.");
+        return Ok(Vec::new());
+    }
+    eprintln!("Found {} open pull request(s).", pulls.len());
+
+    let mut change_sets = Vec::new();
+    for pull in pulls {
+        let files = match client.list_pull_files(pull.number) {
+            Ok(files) => files,
+            Err(err) => {
+                eprintln!("Warning: skipping PR #{}: {err}", pull.number);
+                continue;
+            }
+        };
+
+        let Some(targets) = map_pull_to_specs(
+            &files,
+            spec_root_relative,
+            pull.number,
+            pr_number_as_spec_id,
+        ) else {
+            continue;
+        };
+
+        let mut spec_changes: Vec<dossiers::bundle::SpecChange> = Vec::new();
+        let mut asset_changes: Vec<dossiers::bundle::AssetChange> = Vec::new();
+        let mut spec_meta: Vec<dossiers::bundle::PrSpecMeta> = Vec::new();
+
+        for target in &targets {
+            match build_pr_change_target(
+                client,
+                metadata_reader,
+                spec_root,
+                spec_root_relative,
+                &pull,
+                &files,
+                target,
+            ) {
+                Ok(Some(built)) => {
+                    spec_changes.extend(built.spec_changes);
+                    asset_changes.extend(built.asset_changes);
+                    if let Some(meta) = built.meta {
+                        spec_meta.push(meta);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!(
+                    "Warning: failed to build PR #{} change for spec {}: {err}",
+                    pull.number, target.spec_id
+                ),
+            }
+        }
+
+        if spec_changes.is_empty() && asset_changes.is_empty() {
+            continue;
+        }
+
+        let state = if pull.draft { "DRAFT" } else { "REVIEW" };
+        let url = if pull.html_url.is_empty() {
+            format!("https://github.com/{repo_slug}/pull/{}", pull.number)
+        } else {
+            pull.html_url.clone()
+        };
+        let branch = if pull.head_ref.is_empty() {
+            format!("pull/{}", pull.number)
+        } else {
+            pull.head_ref.clone()
+        };
+
+        eprintln!(
+            "PR #{}: {} spec change(s), {} asset change(s).",
+            pull.number,
+            spec_changes.len(),
+            asset_changes.len()
+        );
+
+        change_sets.push(dossiers::bundle::PrChangeSet {
+            pr_number: pull.number,
+            branch,
+            head_sha: pull.head_sha.clone(),
+            title: pull.title.clone(),
+            author: pull.author.clone(),
+            state: state.to_string(),
+            url,
+            created_at: millis_to_utc(pull.created_at),
+            updated_at: millis_to_utc(pull.updated_at),
+            spec_changes,
+            asset_changes,
+            spec_meta,
+        });
+    }
+
+    Ok(change_sets)
+}
+
+/// Build the change(s) for a single PR target: the PR's version of the source
+/// document (or the local baseline if the PR didn't touch it) plus any changed
+/// or removed assets, along with resolved display metadata.
+fn build_pr_change_target(
+    client: &GithubClient,
+    metadata_reader: &MetadataReader,
+    spec_root: &Path,
+    spec_root_relative: &Path,
+    pull: &GithubPull,
+    files: &[GithubFile],
+    target: &SpecTarget,
+) -> Result<Option<BuiltPrTarget>> {
+    let spec_dir_rel = target.spec_relative_dir.as_path();
+
+    // Partition this target's touched files into upserts and removals, keyed by
+    // their path within the spec directory.
+    let mut upserts: Vec<(String, &GithubFile)> = Vec::new();
+    let mut removals: Vec<String> = Vec::new();
+    for file in files {
+        let repo_path = Path::new(&file.filename);
+        let Some((_current_id, relative_path)) =
+            spec_id_from_repo_path(repo_path, spec_root_relative)
+        else {
+            continue;
+        };
+        let Some(within) = within_spec_dir(&relative_path, spec_dir_rel) else {
+            continue;
+        };
+        if file.status == "removed" {
+            removals.push(within);
+        } else {
+            upserts.push((within, file));
+        }
+    }
+    if upserts.is_empty() && removals.is_empty() {
+        return Ok(None);
+    }
+
+    // Pick the source doc: prefer Markdown, then AsciiDoc, alphabetical within.
+    let mut docs: Vec<&(String, &GithubFile)> = upserts
+        .iter()
+        .filter(|(within, _)| bundle_format_from_path(within).is_some())
+        .collect();
+    docs.sort_by(|a, b| {
+        doc_rank(&a.0)
+            .cmp(&doc_rank(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut spec_changes: Vec<dossiers::bundle::SpecChange> = Vec::new();
+    let mut asset_changes: Vec<dossiers::bundle::AssetChange> = Vec::new();
+
+    let dir_name = pr_spec_dir_name(&target.spec_id, spec_dir_rel);
+
+    // Source document: the PR's version if it changed one, else the local
+    // baseline so the revision still renders.
+    let source_within = docs.first().map(|d| d.0.clone());
+    let (source_path, format, source_bytes) = if let Some((within, file)) =
+        docs.first().map(|d| (d.0.clone(), d.1))
+    {
+        let bytes = download_pr_file(client, file, &pull.head_sha)?;
+        let format = bundle_format_from_path(&within).expect("candidate doc has a doc extension");
+        (within, format, bytes)
+    } else if let Some((within, format, bytes)) = load_baseline_source(spec_root, spec_dir_rel) {
+        (within, format, bytes)
+    } else if !removals.is_empty() {
+        // Nothing to render and the source is gone — record a spec removal.
+        spec_changes.push(dossiers::bundle::SpecChange::Remove {
+            id: target.spec_id.clone(),
+        });
+        return Ok(Some(BuiltPrTarget {
+            spec_changes,
+            asset_changes,
+            meta: None,
+        }));
+    } else {
+        return Ok(None);
+    };
+
+    // Remaining changed files (not the source doc) travel as bundled assets.
+    let mut assets: Vec<dossiers::bundle::Asset> = Vec::new();
+    for (within, file) in &upserts {
+        if source_within.as_ref() == Some(within) {
+            continue;
+        }
+        let bytes = download_pr_file(client, file, &pull.head_sha)?;
+        assets.push(dossiers::bundle::Asset {
+            path: within.clone(),
+            content_type: None,
+            bytes,
+        });
+    }
+
+    // Removed non-source files become asset removals.
+    for within in &removals {
+        if source_within.as_ref() == Some(within) {
+            continue;
+        }
+        asset_changes.push(dossiers::bundle::AssetChange::Remove {
+            spec_id: target.spec_id.clone(),
+            path: within.clone(),
+        });
+    }
+
+    // Resolve display metadata from the source, falling back to PR fields.
+    let source_str = String::from_utf8_lossy(&source_bytes).to_string();
+    let local_format = match format {
+        dossiers::bundle::DocFormat::Markdown => DocFormat::Markdown,
+        dossiers::bundle::DocFormat::Asciidoc => DocFormat::Asciidoc,
+    };
+    let display_name = display_name_from_dir(&dir_name);
+    let meta = metadata_reader
+        .read(&source_str, local_format, &display_name)
+        .metadata;
+    let title = meta
+        .title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| display_name.clone());
+    let status = meta
+        .status
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if pull.draft {
+                "DRAFT".to_string()
+            } else {
+                "REVIEW".to_string()
+            }
+        });
+    let authors = if meta.authors.is_empty() {
+        pull.author.clone().map(|a| vec![a]).unwrap_or_default()
+    } else {
+        meta.authors.clone()
+    };
+    let created = meta
+        .created
+        .as_deref()
+        .and_then(parse_date)
+        .and_then(millis_to_utc)
+        .or_else(|| millis_to_utc(pull.created_at));
+    let updated = meta
+        .updated
+        .as_deref()
+        .and_then(parse_date)
+        .and_then(millis_to_utc)
+        .or_else(|| millis_to_utc(pull.updated_at));
+
+    spec_changes.push(dossiers::bundle::SpecChange::Upsert(
+        dossiers::bundle::Spec {
+            id: target.spec_id.clone(),
+            dir_name,
+            format,
+            source_path,
+            source: source_bytes,
+            assets,
+        },
+    ));
+
+    Ok(Some(BuiltPrTarget {
+        spec_changes,
+        asset_changes,
+        meta: Some(dossiers::bundle::PrSpecMeta {
+            spec_id: target.spec_id.clone(),
+            title,
+            status,
+            authors,
+            created,
+            updated,
+        }),
+    }))
+}
+
+/// Path of `relative_path` within a spec directory `spec_dir_rel`, both taken
+/// relative to the spec root. A flat single-file spec (`0001-name.md`) yields
+/// its own file name; a directory spec yields the path beneath the directory.
+fn within_spec_dir(relative_path: &Path, spec_dir_rel: &Path) -> Option<String> {
+    if relative_path == spec_dir_rel {
+        return relative_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+    }
+    relative_path
+        .strip_prefix(spec_dir_rel)
+        .ok()
+        .map(|rest| rest.to_string_lossy().replace('\\', "/"))
+        .filter(|s| !s.is_empty())
+}
+
+fn bundle_format_from_path(path: &str) -> Option<dossiers::bundle::DocFormat> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "md" | "markdown" => Some(dossiers::bundle::DocFormat::Markdown),
+        "adoc" | "asciidoc" => Some(dossiers::bundle::DocFormat::Asciidoc),
+        _ => None,
+    }
+}
+
+fn doc_rank(path: &str) -> u8 {
+    match bundle_format_from_path(path) {
+        Some(dossiers::bundle::DocFormat::Markdown) => 0,
+        Some(dossiers::bundle::DocFormat::Asciidoc) => 1,
+        None => 2,
+    }
+}
+
+/// Directory name for a PR spec in the package, guaranteed to start with the
+/// target spec id so the consumer's `extract_spec_id` recovers the right id
+/// (the source file may keep a placeholder id like `0000-` from the PR).
+fn pr_spec_dir_name(spec_id: &str, spec_dir_rel: &Path) -> String {
+    let last = spec_dir_rel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let stem = last
+        .strip_suffix(".markdown")
+        .or_else(|| last.strip_suffix(".md"))
+        .or_else(|| last.strip_suffix(".asciidoc"))
+        .or_else(|| last.strip_suffix(".adoc"))
+        .unwrap_or(last);
+    if extract_spec_id(stem).as_deref() == Some(spec_id) {
+        return stem.to_string();
+    }
+    let suffix = stem
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start_matches('-');
+    if suffix.is_empty() {
+        format!("{spec_id}-pr")
+    } else {
+        format!("{spec_id}-{suffix}")
+    }
+}
+
+fn download_pr_file(client: &GithubClient, file: &GithubFile, head_sha: &str) -> Result<Vec<u8>> {
+    if let Some(raw_url) = file.raw_url.as_deref() {
+        match client.download_bytes(raw_url) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => eprintln!(
+                "Warning: raw download failed for {} ({err}); falling back to contents API.",
+                file.filename
+            ),
+        }
+    }
+    client.download_file_at_ref(&file.filename, head_sha)
+}
+
+/// Read the local baseline source document for a spec directory, used when a PR
+/// changes only assets. Returns the source's within-directory path, format, and
+/// bytes.
+fn load_baseline_source(
+    spec_root: &Path,
+    spec_dir_rel: &Path,
+) -> Option<(String, dossiers::bundle::DocFormat, Vec<u8>)> {
+    let local = spec_root.join(spec_dir_rel);
+    if local.is_file() {
+        let name = local.file_name().and_then(|n| n.to_str())?.to_string();
+        let format = bundle_format_from_path(&name)?;
+        let bytes = fs::read(&local).ok()?;
+        return Some((name, format, bytes));
+    }
+    if local.is_dir() {
+        let (doc_path, local_format) = find_doc_file(&local).ok()?;
+        let within = doc_path
+            .strip_prefix(&local)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let format = match local_format {
+            DocFormat::Markdown => dossiers::bundle::DocFormat::Markdown,
+            DocFormat::Asciidoc => dossiers::bundle::DocFormat::Asciidoc,
+        };
+        let bytes = fs::read(&doc_path).ok()?;
+        return Some((within, format, bytes));
+    }
+    None
 }
 
 fn spec_id_from_repo_path(path: &Path, spec_root_relative: &Path) -> Option<(String, PathBuf)> {
@@ -5794,5 +6597,61 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn within_spec_dir_handles_flat_and_dir_specs() {
+        // Flat single-file spec: the file is its own "directory".
+        assert_eq!(
+            within_spec_dir(Path::new("0002-context.md"), Path::new("0002-context.md")),
+            Some("0002-context.md".to_string())
+        );
+        // Directory spec: source and nested asset resolve beneath the dir.
+        assert_eq!(
+            within_spec_dir(Path::new("0001-auth/spec.md"), Path::new("0001-auth")),
+            Some("spec.md".to_string())
+        );
+        assert_eq!(
+            within_spec_dir(Path::new("0001-auth/img/flow.png"), Path::new("0001-auth")),
+            Some("img/flow.png".to_string())
+        );
+        // A file belonging to a different spec is rejected.
+        assert_eq!(
+            within_spec_dir(Path::new("0009-other/spec.md"), Path::new("0001-auth")),
+            None
+        );
+    }
+
+    #[test]
+    fn pr_spec_dir_name_forces_target_id_prefix() {
+        // Template-numbered PR file remapped to the PR number keeps the slug
+        // but adopts the target id so extract_spec_id recovers it.
+        let name = pr_spec_dir_name("0134", Path::new("0000-my-feature.md"));
+        assert_eq!(name, "0134-my-feature");
+        assert_eq!(extract_spec_id(&name).as_deref(), Some("0134"));
+
+        // A revision of an existing spec keeps its directory name unchanged.
+        let name = pr_spec_dir_name("0123", Path::new("0123-server-components"));
+        assert_eq!(name, "0123-server-components");
+        assert_eq!(extract_spec_id(&name).as_deref(), Some("0123"));
+
+        // No usable slug falls back to a `-pr` suffix.
+        let name = pr_spec_dir_name("0055", Path::new("0000.md"));
+        assert_eq!(name, "0055-pr");
+        assert_eq!(extract_spec_id(&name).as_deref(), Some("0055"));
+    }
+
+    #[test]
+    fn bundle_format_from_path_recognizes_doc_extensions() {
+        use dossiers::bundle::DocFormat;
+        assert!(matches!(
+            bundle_format_from_path("spec.md"),
+            Some(DocFormat::Markdown)
+        ));
+        assert!(matches!(
+            bundle_format_from_path("spec.adoc"),
+            Some(DocFormat::Asciidoc)
+        ));
+        assert!(bundle_format_from_path("diagram.png").is_none());
     }
 }

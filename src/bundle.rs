@@ -140,8 +140,37 @@ pub struct PrChangeSet {
     pub pr_number: u64,
     pub branch: String,
     pub head_sha: String,
+    /// PR title from GitHub.
+    pub title: String,
+    /// PR author login, if known.
+    pub author: Option<String>,
+    /// `"DRAFT"` for draft PRs, `"REVIEW"` otherwise.
+    pub state: String,
+    /// GitHub PR URL (`html_url`), for linking out from the rendered site.
+    pub url: String,
+    /// PR creation / last-update times.
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
     pub spec_changes: Vec<SpecChange>,
     pub asset_changes: Vec<AssetChange>,
+    /// Resolved metadata for each target spec the PR touches (title, status,
+    /// authors, dates), computed by the producer so consumers don't re-parse
+    /// the source. Keyed by spec id.
+    pub spec_meta: Vec<PrSpecMeta>,
+}
+
+/// Producer-resolved metadata for one spec targeted by a PR change-set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrSpecMeta {
+    pub spec_id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,9 +203,23 @@ struct PrMetaWire {
     branch: String,
     head_sha: String,
     #[serde(default)]
+    title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     removed_specs: Vec<String>,
     #[serde(default)]
     removed_assets: Vec<RemovedAssetWire>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spec_meta: Vec<PrSpecMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +252,13 @@ impl Package {
                 pr_number: pr.pr_number,
                 branch: pr.branch.clone(),
                 head_sha: pr.head_sha.clone(),
+                title: pr.title.clone(),
+                author: pr.author.clone(),
+                state: pr.state.clone(),
+                url: pr.url.clone(),
+                created_at: pr.created_at,
+                updated_at: pr.updated_at,
+                spec_meta: pr.spec_meta.clone(),
                 removed_specs: pr
                     .spec_changes
                     .iter()
@@ -409,8 +459,15 @@ impl Package {
                 pr_number,
                 branch: meta.branch,
                 head_sha: meta.head_sha,
+                title: meta.title,
+                author: meta.author,
+                state: meta.state,
+                url: meta.url,
+                created_at: meta.created_at,
+                updated_at: meta.updated_at,
                 spec_changes,
                 asset_changes,
+                spec_meta: meta.spec_meta,
             });
         }
 
@@ -628,6 +685,20 @@ mod tests {
                 pr_number: 42,
                 branch: "feature/auth".into(),
                 head_sha: "deadbeef".into(),
+                title: "Rewrite authentication".into(),
+                author: Some("octocat".into()),
+                state: "REVIEW".into(),
+                url: "https://github.com/acme/specs/pull/42".into(),
+                created_at: DateTime::<Utc>::from_timestamp(1_700_000_100, 0),
+                updated_at: DateTime::<Utc>::from_timestamp(1_700_000_200, 0),
+                spec_meta: vec![PrSpecMeta {
+                    spec_id: "0001".into(),
+                    title: "Authentication (rewrite)".into(),
+                    status: "REVIEW".into(),
+                    authors: vec!["octocat".into()],
+                    created: DateTime::<Utc>::from_timestamp(1_700_000_100, 0),
+                    updated: DateTime::<Utc>::from_timestamp(1_700_000_200, 0),
+                }],
                 spec_changes: vec![
                     SpecChange::Upsert(Spec {
                         id: "0001".into(),
@@ -686,6 +757,18 @@ mod tests {
         assert_eq!(pr.pr_number, 42);
         assert_eq!(pr.branch, "feature/auth");
         assert_eq!(pr.head_sha, "deadbeef");
+        assert_eq!(pr.title, "Rewrite authentication");
+        assert_eq!(pr.author.as_deref(), Some("octocat"));
+        assert_eq!(pr.state, "REVIEW");
+        assert_eq!(pr.url, "https://github.com/acme/specs/pull/42");
+        assert_eq!(
+            pr.created_at,
+            DateTime::<Utc>::from_timestamp(1_700_000_100, 0)
+        );
+        assert_eq!(pr.spec_meta.len(), 1);
+        assert_eq!(pr.spec_meta[0].spec_id, "0001");
+        assert_eq!(pr.spec_meta[0].title, "Authentication (rewrite)");
+        assert_eq!(pr.spec_meta[0].authors, vec!["octocat".to_string()]);
 
         let upserts: Vec<&Spec> = pr
             .spec_changes

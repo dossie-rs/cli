@@ -15,9 +15,12 @@ pub struct GithubPull {
     pub number: u64,
     pub draft: bool,
     pub head_sha: String,
+    pub head_ref: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub author: Option<String>,
+    pub title: String,
+    pub html_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -82,9 +85,12 @@ impl GithubClient {
                 number: pull.number,
                 draft: pull.draft,
                 head_sha: pull.head.sha,
+                head_ref: pull.head.git_ref,
                 created_at: parse_timestamp(&pull.created_at),
                 updated_at: parse_timestamp(&pull.updated_at),
                 author: pull.user.map(|u| u.login),
+                title: pull.title,
+                html_url: pull.html_url,
             }));
 
             if count < 50 {
@@ -247,11 +253,17 @@ struct PullResponse {
     updated_at: String,
     #[serde(default)]
     user: Option<UserRef>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    html_url: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct HeadRef {
     sha: String,
+    #[serde(rename = "ref", default)]
+    git_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
