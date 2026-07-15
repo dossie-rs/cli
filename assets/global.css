@@ -340,7 +340,6 @@ main {
   font-size: 0.8rem;
   display: inline-block;
   width: 5rem;
-  align-self: flex-end;
 }
 
 .meta-value {
@@ -501,7 +500,7 @@ a.tag:focus-visible {
 
 .spec-header {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   gap: 1rem;
   flex-wrap: wrap;
 
