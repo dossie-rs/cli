@@ -7,6 +7,8 @@ autobins = false
 homepage = "https://dossie.rs"
 repository = "https://github.com/dossie-rs/cli"
 license = "MIT"
+keywords = ["documentation", "markdown", "asciidoc", "docs", "cli"]
+categories = ["command-line-utilities", "web-programming::http-server", "text-processing"]
 # The npm/ dir is the npm-wrapper package (published separately, not part of the crate).
 exclude = ["/npm"]
 
