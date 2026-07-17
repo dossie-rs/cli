@@ -19,8 +19,22 @@ pub struct GithubPull {
     pub created_at: i64,
     pub updated_at: i64,
     pub author: Option<String>,
+    /// Avatar of the PR author, if GitHub returned one.
+    pub avatar_url: Option<String>,
     pub title: String,
     pub html_url: String,
+}
+
+/// The GitHub identity behind a commit: the git author email recorded in the
+/// commit object, plus the GitHub account that email is linked to (if any),
+/// with its avatar and profile URL. Used to credit and illustrate the initial
+/// committer of a spec.
+#[derive(Clone, Debug, Default)]
+pub struct CommitIdentity {
+    pub email: Option<String>,
+    pub login: Option<String>,
+    pub avatar_url: Option<String>,
+    pub html_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,16 +95,23 @@ impl GithubClient {
                 .context("requesting open pull requests")?;
             let page_pulls: Vec<PullResponse> = parse_json(response)?;
             let count = page_pulls.len();
-            pulls.extend(page_pulls.into_iter().map(|pull| GithubPull {
-                number: pull.number,
-                draft: pull.draft,
-                head_sha: pull.head.sha,
-                head_ref: pull.head.git_ref,
-                created_at: parse_timestamp(&pull.created_at),
-                updated_at: parse_timestamp(&pull.updated_at),
-                author: pull.user.map(|u| u.login),
-                title: pull.title,
-                html_url: pull.html_url,
+            pulls.extend(page_pulls.into_iter().map(|pull| {
+                let (author, avatar_url) = match pull.user {
+                    Some(u) => (Some(u.login), u.avatar_url),
+                    None => (None, None),
+                };
+                GithubPull {
+                    number: pull.number,
+                    draft: pull.draft,
+                    head_sha: pull.head.sha,
+                    head_ref: pull.head.git_ref,
+                    created_at: parse_timestamp(&pull.created_at),
+                    updated_at: parse_timestamp(&pull.updated_at),
+                    author,
+                    avatar_url,
+                    title: pull.title,
+                    html_url: pull.html_url,
+                }
             }));
 
             if count < 50 {
@@ -130,6 +151,26 @@ impl GithubClient {
         }
 
         Ok(files)
+    }
+
+    /// Resolve a commit to the GitHub account behind its author. Returns the
+    /// git author email (always, when present in the commit object) plus the
+    /// linked GitHub `login`/`avatar_url`/`html_url` when GitHub could map that
+    /// email to an account (the `author` field is null otherwise).
+    pub fn get_commit(&self, sha: &str) -> Result<CommitIdentity> {
+        let url = self.api_url(&format!("commits/{sha}"));
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .with_context(|| format!("requesting commit {sha}"))?;
+        let parsed: CommitResponse = parse_json(response)?;
+        Ok(CommitIdentity {
+            email: parsed.commit.author.and_then(|a| a.email),
+            login: parsed.author.as_ref().map(|u| u.login.clone()),
+            avatar_url: parsed.author.as_ref().map(|u| u.avatar_url.clone()),
+            html_url: parsed.author.map(|u| u.html_url),
+        })
     }
 
     pub fn download_bytes(&self, url: &str) -> Result<Vec<u8>> {
@@ -282,6 +323,39 @@ struct ContentResponse {
 #[derive(Debug, Deserialize)]
 struct UserRef {
     login: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitResponse {
+    #[serde(default)]
+    commit: CommitObject,
+    /// The GitHub account linked to the commit author's email; null when the
+    /// email isn't associated with any GitHub user.
+    #[serde(default)]
+    author: Option<CommitUser>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommitObject {
+    #[serde(default)]
+    author: Option<CommitGitAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitGitAuthor {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitUser {
+    login: String,
+    #[serde(default)]
+    avatar_url: String,
+    #[serde(default)]
+    html_url: String,
 }
 
 fn parse_timestamp(raw: &str) -> i64 {

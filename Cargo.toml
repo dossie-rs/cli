@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 lazy_static = "1"
+md5 = "0.7"
 maud = { version = "0.25", features = ["actix-web"] }
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 asciidoc-parser = "0.14"

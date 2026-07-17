@@ -16,6 +16,10 @@ pub struct DocumentMetadata {
     pub created: Option<String>,
     pub updated: Option<String>,
     pub authors: Vec<String>,
+    /// Author strings exactly as declared (before `normalize_authors` strips
+    /// `<email>`). Empty when no `authors:` frontmatter was present. Used to
+    /// resolve avatars by email; display still uses the normalized `authors`.
+    pub raw_authors: Vec<String>,
     pub links: Vec<Link>,
     pub extra: HashMap<String, MetadataValue>,
 }
@@ -187,6 +191,10 @@ impl MetadataReader {
                 .or_else(|| Some(fallback_title.to_string()).filter(|value| !value.is_empty()));
         }
 
+        // Keep the raw author strings (with any `<email>`) before normalization
+        // strips the addresses — the producer needs them to match authors to
+        // GitHub / Gravatar avatars.
+        metadata.raw_authors = metadata.authors.clone();
         metadata.authors = normalize_authors(metadata.authors);
 
         MetadataReadResult { metadata, body }

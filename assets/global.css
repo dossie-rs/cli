@@ -382,6 +382,78 @@ main {
   color: var(--accent);
 }
 
+/* Author avatars (GitHub or Gravatar), rendered next to author names on cards,
+   detail-page bylines, and the author index/heading. */
+.author-avatar {
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(148, 163, 184, 0.25);
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
+.author-avatar--sm {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+.author-avatar--lg {
+  width: 2.5rem;
+  height: 2.5rem;
+}
+
+/* The author metadata row links become avatar + name chips. */
+.spec-author-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  text-decoration: none;
+}
+
+.spec-author-link .author-name {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.author-list {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+}
+
+/* Card byline: an overlapping avatar stack followed by a compact name label. */
+.byline-authors {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.byline-avatars {
+  display: inline-flex;
+  align-items: center;
+}
+
+.byline-avatars .author-avatar {
+  margin-left: -0.45rem;
+  /* A ring in the card colour so overlapping avatars read as separate. */
+  border: 2px solid var(--surface);
+}
+
+.byline-avatars .author-avatar:first-child {
+  margin-left: 0;
+}
+
+.author-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
 .tag {
   display: inline-flex;
   align-items: center;

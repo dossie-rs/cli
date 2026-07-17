@@ -86,6 +86,12 @@ pub struct SpecIndexEntry {
     pub updated: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authors: Vec<String>,
+    /// Producer-resolved rich author identities (display name + optional avatar
+    /// and profile URL), parallel to `authors` and in the same order. `authors`
+    /// remains the name-only list that drives slugs, search, and the author
+    /// index; this carries the presentation data those consumers don't need.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors_meta: Vec<Author>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, serde_json::Value>,
     /// Producer-resolved outbound links (the document's `links:` frontmatter).
@@ -96,6 +102,20 @@ pub struct SpecIndexEntry {
     /// `extra` map can't express; `extra` remains the machine-readable map.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<MetaField>,
+}
+
+/// A producer-resolved author identity: a display name plus, when resolved, an
+/// avatar and a profile URL. Names come from the document's `authors:`
+/// frontmatter or, failing that, the git commit that first added the spec.
+/// Avatars come from the author's linked GitHub account (resolved via the
+/// commits API) or fall back to a Gravatar derived from the commit email.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Author {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// A producer-resolved outbound link, rendered under the "Links" metadata row.
@@ -216,6 +236,9 @@ pub struct PrSpecMeta {
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authors: Vec<String>,
+    /// Rich author identities parallel to `authors` (see `SpecIndexEntry`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors_meta: Vec<Author>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -754,6 +777,11 @@ mod tests {
                     title: "Authentication (rewrite)".into(),
                     status: "REVIEW".into(),
                     authors: vec!["octocat".into()],
+                    authors_meta: vec![Author {
+                        name: "octocat".into(),
+                        avatar_url: Some("https://avatars.githubusercontent.com/u/583231".into()),
+                        url: Some("https://github.com/octocat".into()),
+                    }],
                     created: DateTime::<Utc>::from_timestamp(1_700_000_100, 0),
                     updated: DateTime::<Utc>::from_timestamp(1_700_000_200, 0),
                     links: vec![],
@@ -829,6 +857,14 @@ mod tests {
         assert_eq!(pr.spec_meta[0].spec_id, "0001");
         assert_eq!(pr.spec_meta[0].title, "Authentication (rewrite)");
         assert_eq!(pr.spec_meta[0].authors, vec!["octocat".to_string()]);
+        assert_eq!(
+            pr.spec_meta[0].authors_meta,
+            vec![Author {
+                name: "octocat".into(),
+                avatar_url: Some("https://avatars.githubusercontent.com/u/583231".into()),
+                url: Some("https://github.com/octocat".into()),
+            }]
+        );
 
         let upserts: Vec<&Spec> = pr
             .spec_changes

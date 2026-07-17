@@ -98,10 +98,25 @@ pub fn last_commit_timestamp(repo: &GitRepository, paths: &[PathBuf]) -> Option<
     GitTimestampCache::from_paths(repo, paths).latest_change(paths)
 }
 
-#[derive(Default, Clone, Copy)]
+/// The git identity that first added a file: the *author* of the addition
+/// commit (who wrote it), not the committer (who applied it). Used to credit a
+/// spec that declares no `authors:` frontmatter. `email` feeds a GitHub / Gravatar
+/// avatar lookup; `commit_sha` lets the producer resolve the linked GitHub
+/// account via the commits API.
+#[derive(Debug, Clone)]
+pub struct GitAuthor {
+    pub name: String,
+    pub email: String,
+    pub commit_sha: String,
+}
+
+#[derive(Default, Clone)]
 struct PathTimes {
     addition: Option<i64>,
     last_change: Option<i64>,
+    /// Author of the commit that added this path (only set on an
+    /// Added/Renamed/Copied delta, never a plain modification).
+    addition_author: Option<GitAuthor>,
 }
 
 pub struct GitTimestampCache {
@@ -139,6 +154,37 @@ impl GitTimestampCache {
             .filter_map(|times| times.last_change)
             .max()
     }
+
+    /// The author of the commit that added the spec, tied to the same addition
+    /// as [`latest_addition`] (the most recent addition among `paths`) so the
+    /// credited author and the displayed "Created" date come from one commit.
+    /// `None` when no addition was recorded — e.g. an existing file merely
+    /// modified within an incremental range, so the caller keeps the stored
+    /// author instead of overwriting it with the editor.
+    pub fn addition_author(&self, paths: &[PathBuf]) -> Option<&GitAuthor> {
+        paths
+            .iter()
+            .filter_map(|path| self.times.get(path))
+            .filter(|times| times.addition.is_some())
+            .max_by_key(|times| times.addition)
+            .and_then(|times| times.addition_author.as_ref())
+    }
+}
+
+/// Extract the git *author* identity from a commit (name, email, and the
+/// commit's own SHA). `None` when the signature carries neither name nor email.
+fn commit_author(commit: &git2::Commit) -> Option<GitAuthor> {
+    let sig = commit.author();
+    let name = sig.name().unwrap_or("").trim().to_string();
+    let email = sig.email().unwrap_or("").trim().to_string();
+    if name.is_empty() && email.is_empty() {
+        return None;
+    }
+    Some(GitAuthor {
+        name,
+        email,
+        commit_sha: commit.id().to_string(),
+    })
 }
 
 struct UpdateFlags {
@@ -216,6 +262,7 @@ fn build_cache(repo: &GitRepository, paths: &[PathBuf]) -> GitTimestampCache {
                     if let Some(entry) = times.get_mut(path) {
                         if entry.addition.is_none() {
                             entry.addition = Some(time);
+                            entry.addition_author = commit_author(&commit);
                             updated.addition = true;
                         }
                     }
@@ -292,9 +339,17 @@ fn build_cache_since(repo: &GitRepository, base: &str, paths: &[PathBuf]) -> Git
                 }
                 // TIME sorting means the first sighting is the most recent
                 // change. Record it as both the addition and last-change time.
+                let status = delta.status();
                 if let Some(entry) = times.get_mut(path) {
                     entry.addition = Some(time);
                     entry.last_change = Some(time);
+                    // Only credit an author when the file is genuinely (re)added
+                    // in this range. A plain modification of an existing spec
+                    // leaves the author unset so the producer sends none and the
+                    // server keeps the originally-detected initial committer.
+                    if matches!(status, Delta::Added | Delta::Renamed | Delta::Copied) {
+                        entry.addition_author = commit_author(&commit);
+                    }
                 }
                 pending.remove(path);
             }
@@ -333,4 +388,88 @@ fn normalize_paths(root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
 
 fn commit_time_to_millis(commit: &git2::Commit) -> i64 {
     commit.time().seconds() * 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::{IndexAddOption, Repository, Signature, Time};
+    use std::fs;
+
+    fn temp_repo(tag: &str) -> (PathBuf, Repository) {
+        let dir = std::env::temp_dir().join(format!(
+            "dossiers-git-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        (dir, repo)
+    }
+
+    fn commit_all(repo: &Repository, sig: &Signature, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), sig, sig, message, &tree, &parents)
+            .unwrap();
+    }
+
+    #[test]
+    fn addition_author_credits_the_original_committer_not_the_editor() {
+        let (dir, repo) = temp_repo("addition-author");
+        let alice = Signature::new("Alice", "alice@example.com", &Time::new(1_000, 0)).unwrap();
+        fs::write(dir.join("spec.md"), b"# One\n").unwrap();
+        commit_all(&repo, &alice, "add spec");
+
+        // A later edit by Bob must NOT change the credited author.
+        let bob = Signature::new("Bob", "bob@example.com", &Time::new(2_000, 0)).unwrap();
+        fs::write(dir.join("spec.md"), b"# One\n\nmore\n").unwrap();
+        commit_all(&repo, &bob, "edit spec");
+        drop(repo);
+
+        let git = open_git_repository(&dir).unwrap();
+        let paths = vec![PathBuf::from("spec.md")];
+        let cache = GitTimestampCache::from_paths(&git, &paths);
+        let author = cache.addition_author(&paths).expect("addition author");
+        assert_eq!(author.name, "Alice");
+        assert_eq!(author.email, "alice@example.com");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addition_author_absent_when_only_modified_in_incremental_range() {
+        let (dir, repo) = temp_repo("addition-since");
+        let alice = Signature::new("Alice", "alice@example.com", &Time::new(1_000, 0)).unwrap();
+        fs::write(dir.join("spec.md"), b"# One\n").unwrap();
+        commit_all(&repo, &alice, "add spec");
+        let base = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+
+        let bob = Signature::new("Bob", "bob@example.com", &Time::new(2_000, 0)).unwrap();
+        fs::write(dir.join("spec.md"), b"# One\n\nmore\n").unwrap();
+        commit_all(&repo, &bob, "edit spec");
+        drop(repo);
+
+        let git = open_git_repository(&dir).unwrap();
+        let paths = vec![PathBuf::from("spec.md")];
+        // Only Bob's modification falls in (base, HEAD]; it's not an addition,
+        // so no author is credited and the server keeps the stored one.
+        let cache = GitTimestampCache::since(&git, &base, &paths);
+        assert!(cache.addition_author(&paths).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

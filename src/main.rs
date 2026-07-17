@@ -107,6 +107,14 @@ struct SpecDocument {
     created: Option<i64>,
     updated: Option<i64>,
     authors: Vec<String>,
+    /// Rich author identities (name + avatar + profile) for rendering. Resolved
+    /// locally (Gravatar / GitHub-noreply) during load; the push path
+    /// re-resolves from `author_seeds` with GitHub for the wire package.
+    authors_meta: Vec<dossiers::bundle::Author>,
+    /// Resolution inputs (name + email + addition-commit SHA) behind
+    /// `authors_meta`, kept so the push path can upgrade avatars to linked
+    /// GitHub accounts.
+    author_seeds: Vec<dossiers::authors::AuthorSeed>,
     links: Vec<Link>,
     updated_sort: i64,
     extra: HashMap<String, Value>,
@@ -131,6 +139,9 @@ struct PendingSpec {
     title: String,
     status: Option<String>,
     authors: Vec<String>,
+    /// Raw author strings (with `<email>`) as declared in frontmatter, for
+    /// avatar resolution; empty when the spec declares no authors.
+    raw_authors: Vec<String>,
     links: Vec<Link>,
     extra: HashMap<String, Value>,
     body: String,
@@ -988,6 +999,7 @@ fn load_specs_from_directory(
             title,
             status: meta.status,
             authors: meta.authors,
+            raw_authors: meta.raw_authors,
             links: meta.links,
             extra: metadata_extra_to_json(&meta.extra),
             body: parsed_doc.body,
@@ -1047,6 +1059,26 @@ fn load_specs_from_directory(
         let git_managed = git_repo.is_some() && (git_addition.is_some() || git_change.is_some());
         let status = metadata_reader.resolve_status(pending.status.clone(), git_managed);
 
+        // Credit the spec: frontmatter authors override, else the git author of
+        // the commit that first added it. Resolve avatars locally (Gravatar /
+        // GitHub-noreply) for offline/static rendering; the push path upgrades
+        // them to linked GitHub accounts from `author_seeds`.
+        let git_author = git_cache
+            .as_ref()
+            .and_then(|cache| cache.addition_author(&pending.git_paths))
+            .cloned();
+        let author_seeds =
+            dossiers::authors::build_seeds(&pending.raw_authors, git_author.as_ref());
+        let authors_meta = dossiers::authors::resolve_authors(
+            &author_seeds,
+            &dossiers::authors::AuthorResolver::local(),
+        );
+        let authors: Vec<String> = if author_seeds.is_empty() {
+            pending.authors
+        } else {
+            author_seeds.iter().map(|seed| seed.name.clone()).collect()
+        };
+
         specs.push(SpecDocument {
             id: pending.id,
             dir_name: pending.dir_name,
@@ -1054,7 +1086,9 @@ fn load_specs_from_directory(
             status,
             created,
             updated,
-            authors: pending.authors,
+            authors,
+            authors_meta,
+            author_seeds,
             links: pending.links,
             updated_sort,
             extra: pending.extra,
@@ -1831,20 +1865,28 @@ fn run_build(
         copy_doc_assets(&mount_map, &spec.id, &asset_paths, &output_dir)?;
     }
 
-    let mut authors: HashMap<String, String> = HashMap::new();
-    for author in state.specs.iter().flat_map(|spec| spec.authors.iter()) {
-        let slug = slugify_author(author);
-        authors.entry(slug).or_insert_with(|| author.clone());
+    let mut authors: HashMap<String, dossiers::bundle::Author> = HashMap::new();
+    for author in state.specs.iter().flat_map(|spec| spec.authors_meta.iter()) {
+        let slug = slugify_author(&author.name);
+        let entry = authors.entry(slug).or_insert_with(|| author.clone());
+        // Prefer an identity that carries an avatar for the heading.
+        if entry.avatar_url.is_none() && author.avatar_url.is_some() {
+            *entry = author.clone();
+        }
     }
 
-    for (slug, name) in authors {
+    for (slug, author) in authors {
         let authored: Vec<&SpecDocument> = state
             .specs
             .iter()
-            .filter(|spec| spec.authors.iter().any(|a| slugify_author(a) == slug))
+            .filter(|spec| {
+                spec.authors_meta
+                    .iter()
+                    .any(|a| slugify_author(&a.name) == slug)
+            })
             .collect();
         let page =
-            render_author(&state, &name, &authored, "../../", trailing_slashes).into_string();
+            render_author(&state, &author, &authored, "../../", trailing_slashes).into_string();
         let dest = output_dir.join("author").join(slug).join("index.html");
         write_html_file(&dest, page)?;
     }
@@ -2729,6 +2771,18 @@ fn build_spec_index(
         .map(|s| (s.id.clone(), s))
         .collect();
 
+    // Resolve author avatars. A GitHub token + repo upgrades avatars to the
+    // authors' linked GitHub accounts (one commits-API call per unique addition
+    // commit); without it, the local Gravatar / noreply avatars computed during
+    // load are kept.
+    let resolver = match github_client_for(specs_dir, project_config) {
+        Some(client) => dossiers::authors::AuthorResolver::from_github(
+            &client,
+            by_id.values().flat_map(|doc| doc.author_seeds.iter()),
+        ),
+        None => dossiers::authors::AuthorResolver::local(),
+    };
+
     let mut entries = Vec::with_capacity(mainline.specs.len());
     for spec in &mainline.specs {
         let Some(doc) = by_id.remove(&spec.id) else {
@@ -2736,6 +2790,14 @@ fn build_spec_index(
         };
         let links = resolve_meta_links(&doc.links);
         let fields = resolve_meta_fields(&doc.extra, &project_config.extra_metadata_fields);
+        let authors_meta = dossiers::authors::resolve_authors(&doc.author_seeds, &resolver);
+        // Keep `authors` (names) in lockstep with the rich list; fall back to
+        // the doc's own names only if there were no seeds at all.
+        let authors: Vec<String> = if authors_meta.is_empty() {
+            doc.authors
+        } else {
+            authors_meta.iter().map(|a| a.name.clone()).collect()
+        };
         entries.push(dossiers::bundle::SpecIndexEntry {
             id: spec.id.clone(),
             dir_name: spec.dir_name.clone(),
@@ -2745,13 +2807,41 @@ fn build_spec_index(
             status: doc.status,
             created: doc.created.and_then(millis_to_utc),
             updated: doc.updated.and_then(millis_to_utc),
-            authors: doc.authors,
+            authors,
+            authors_meta,
             extra: doc.extra.into_iter().collect(),
             links,
             fields,
         });
     }
     Ok(entries)
+}
+
+/// A GitHub client for avatar resolution, from `GITHUB_TOKEN` plus the repo in
+/// the project config or the spec directory's git remote. `None` when the token
+/// or repo is missing — the caller then keeps the local Gravatar/noreply
+/// avatars rather than failing the push.
+fn github_client_for(
+    specs_dir: &Path,
+    project_config: &ProjectConfiguration,
+) -> Option<GithubClient> {
+    let token = match env::var("GITHUB_TOKEN") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return None,
+    };
+    let git_repo = open_git_repository(specs_dir);
+    let repo = project_config
+        .repository
+        .as_deref()
+        .and_then(parse_github_repo)
+        .or_else(|| {
+            git_repo
+                .as_ref()
+                .and_then(|r| r.remote_url())
+                .as_deref()
+                .and_then(parse_github_repo)
+        })?;
+    GithubClient::new(repo, &token).ok()
 }
 
 fn millis_to_utc(ms: i64) -> Option<chrono::DateTime<Utc>> {
@@ -3155,6 +3245,24 @@ fn build_pr_spec_version(
     let updated_sort = updated;
 
     let status = meta.status.unwrap_or(status_fallback);
+    // Credit the PR preview: declared frontmatter authors override; otherwise
+    // the PR author with the avatar GitHub returned on the pulls listing.
+    let author_seeds = dossiers::authors::seeds_from_names(&meta.raw_authors);
+    let authors_meta: Vec<dossiers::bundle::Author> = if meta.raw_authors.is_empty() {
+        match &pull.author {
+            Some(login) => vec![dossiers::bundle::Author {
+                name: login.clone(),
+                avatar_url: pull.avatar_url.clone(),
+                url: Some(format!("https://github.com/{login}")),
+            }],
+            None => Vec::new(),
+        }
+    } else {
+        dossiers::authors::resolve_authors(
+            &author_seeds,
+            &dossiers::authors::AuthorResolver::local(),
+        )
+    };
     let pr_id = if base_exists {
         format!("{}/pr/{}", spec_id, pull.number)
     } else {
@@ -3172,6 +3280,8 @@ fn build_pr_spec_version(
         created,
         updated: Some(updated),
         authors,
+        authors_meta,
+        author_seeds,
         links: meta.links,
         updated_sort,
         extra: metadata_extra_to_json(&meta.extra),
@@ -3535,10 +3645,25 @@ fn build_pr_change_target(
                 "REVIEW".to_string()
             }
         });
-    let authors = if meta.authors.is_empty() {
+    // Credit the PR: declared frontmatter authors override; otherwise the PR
+    // author, whose avatar GitHub already gave us on the pulls listing.
+    let authors_meta: Vec<dossiers::bundle::Author> = if meta.raw_authors.is_empty() {
+        match &pull.author {
+            Some(login) => vec![dossiers::bundle::Author {
+                name: login.clone(),
+                avatar_url: pull.avatar_url.clone(),
+                url: Some(format!("https://github.com/{login}")),
+            }],
+            None => Vec::new(),
+        }
+    } else {
+        let seeds = dossiers::authors::seeds_from_names(&meta.raw_authors);
+        dossiers::authors::resolve_authors(&seeds, &dossiers::authors::AuthorResolver::local())
+    };
+    let authors: Vec<String> = if authors_meta.is_empty() {
         pull.author.clone().map(|a| vec![a]).unwrap_or_default()
     } else {
-        meta.authors.clone()
+        authors_meta.iter().map(|a| a.name.clone()).collect()
     };
     let created = meta
         .created
@@ -3576,6 +3701,7 @@ fn build_pr_change_target(
             title,
             status,
             authors,
+            authors_meta,
             created,
             updated,
             links,
@@ -4138,14 +4264,20 @@ async fn author_page(
         })
         .collect();
 
-    let author_name = authored
+    // Prefer a credited identity that carries an avatar for the page heading.
+    let display_author = authored
         .iter()
-        .flat_map(|spec| spec.authors.iter())
-        .find(|name| slugify_author(name) == slug)
+        .flat_map(|spec| spec.authors_meta.iter())
+        .filter(|author| slugify_author(&author.name) == slug)
+        .max_by_key(|author| author.avatar_url.is_some())
         .cloned()
-        .unwrap_or_else(|| slug.clone());
+        .unwrap_or_else(|| dossiers::bundle::Author {
+            name: slug.clone(),
+            avatar_url: None,
+            url: None,
+        });
 
-    let markup = render_author(&loaded, &author_name, &authored, "/", false);
+    let markup = render_author(&loaded, &display_author, &authored, "/", false);
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(markup.into_string())
@@ -4205,6 +4337,68 @@ async fn status_page(
         .body(markup.into_string())
 }
 
+/// Byline authors for a card: an overlapping avatar stack (the first few that
+/// have avatars) plus a compact label. Not individually linked (the whole card
+/// is the link). Mirrors the server renderer's `byline_authors`.
+fn byline_authors(authors: &[dossiers::bundle::Author]) -> Markup {
+    let stack: Vec<&dossiers::bundle::Author> = authors
+        .iter()
+        .filter(|a| a.avatar_url.is_some())
+        .take(3)
+        .collect();
+    html! {
+        span class="byline-item byline-authors" {
+            @if !stack.is_empty() {
+                span class="byline-avatars" {
+                    @for author in &stack {
+                        @if let Some(avatar) = &author.avatar_url {
+                            img class="author-avatar author-avatar--sm" src=(avatar)
+                                alt="" loading="lazy" referrerpolicy="no-referrer";
+                        }
+                    }
+                }
+            }
+            span class="byline-author-names" { (byline_author_label(authors)) }
+        }
+    }
+}
+
+/// Compact author label for a card byline: one name, two joined with "and", or
+/// the first name plus "+ N others" for three or more. Mirrors the server.
+fn byline_author_label(authors: &[dossiers::bundle::Author]) -> String {
+    match authors {
+        [] => String::new(),
+        [a] => a.name.clone(),
+        [a, b] => format!("{} and {}", a.name, b.name),
+        [a, rest @ ..] => format!("{} + {} others", a.name, rest.len()),
+    }
+}
+
+/// The "Author(s)" metadata row for the spec detail page: avatar (when known) +
+/// name, each linking to the author page. Mirrors the server's `author_row`.
+fn author_row(prefix: &str, authors: &[dossiers::bundle::Author]) -> Markup {
+    html! {
+        @if !authors.is_empty() {
+            div class="spec-header" {
+                span class="meta-label" { "Author" @if authors.len() > 1 { "s" } }
+                span class="author-list" {
+                    @for (index, author) in authors.iter().enumerate() {
+                        @if index > 0 { span class="meta-divider" { "•" } }
+                        a class="spec-author-link"
+                            href={(join_prefix(prefix, format!("author/{}", slugify_author(&author.name))))} {
+                            @if let Some(avatar) = &author.avatar_url {
+                                img class="author-avatar" src=(avatar)
+                                    alt="" loading="lazy" referrerpolicy="no-referrer";
+                            }
+                            span class="author-name" { (&author.name) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn spec_card(href: String, display_id: &str, spec: &SpecDocument) -> Markup {
     html! {
         a class="spec-card" href=(href) {
@@ -4214,8 +4408,8 @@ fn spec_card(href: String, display_id: &str, spec: &SpecDocument) -> Markup {
                     span class="spec-title" { (&spec.title) }
                 }
                 div class="spec-card-byline" {
-                    @if !spec.authors.is_empty() {
-                        span class="byline-item byline-authors" { (spec.authors.join(", ")) }
+                    @if !spec.authors_meta.is_empty() {
+                        (byline_authors(&spec.authors_meta))
                     }
                     span class="byline-item" { "Created " (format_spec_date(spec.created, false).unwrap_or_else(|| "n/a".into())) }
                     span class="byline-item" { "Updated " (format_spec_date(spec.updated, false).unwrap_or_else(|| "n/a".into())) }
@@ -4401,17 +4595,7 @@ fn render_spec(
                 }
             }
 
-            @if !spec.authors.is_empty() {
-                div class="spec-header" {
-                    span class="meta-label" { "Author" @if spec.authors.len() > 1 { "s" } }
-                    span {
-                        @for (index, author) in spec.authors.iter().enumerate() {
-                            @if index > 0 { span class="meta-divider" { "•" } }
-                            a class="spec-author-link" href={(join_prefix(prefix, format!("author/{}", slugify_author(author))))} { (author) }
-                        }
-                    }
-                }
-            }
+            (author_row(prefix, &spec.authors_meta))
 
             div class="spec-header" {
                 span class="meta-label" { "Created" }
@@ -4512,20 +4696,24 @@ fn render_spec(
 
 fn render_author(
     state: &AppState,
-    author_name: &str,
+    author: &dossiers::bundle::Author,
     authored: &[&SpecDocument],
     prefix: &str,
     trailing_slashes: bool,
 ) -> Markup {
-    let title = format!("{author_name} - {}", state.site_name);
-    let description = format!("All specs attributed to {author_name}");
+    let title = format!("{} - {}", author.name, state.site_name);
+    let description = format!("All specs attributed to {}", author.name);
 
     let content = html! {
         main class="container" {
             a class="back-link" href={(join_prefix(prefix, ""))} { "← Back to index" }
 
-            div class="spec-header" {
-                h1 { "Specs by " (author_name) }
+            div class="spec-header author-heading" {
+                @if let Some(avatar) = &author.avatar_url {
+                    img class="author-avatar author-avatar--lg" src=(avatar)
+                        alt="" loading="lazy" referrerpolicy="no-referrer";
+                }
+                h1 { "Specs by " (author.name) }
                 span class="spec-dir" { (format!("{} spec{}", authored.len(), if authored.len() == 1 { "" } else { "s" })) }
             }
 
@@ -4882,6 +5070,19 @@ fn spec_from_generated(spec: GeneratedSpec) -> Result<SpecDocument> {
 
     let source = strip_frontmatter(&spec.source, &format);
 
+    // JSON specs carry no git history; resolve avatars from the declared author
+    // strings alone (Gravatar / GitHub-noreply when an email is present).
+    let author_seeds = dossiers::authors::seeds_from_names(&spec.authors);
+    let authors_meta = dossiers::authors::resolve_authors(
+        &author_seeds,
+        &dossiers::authors::AuthorResolver::local(),
+    );
+    let authors = if authors_meta.is_empty() {
+        normalize_authors(spec.authors)
+    } else {
+        authors_meta.iter().map(|a| a.name.clone()).collect()
+    };
+
     Ok(SpecDocument {
         id: spec.id,
         dir_name: spec.dir_name,
@@ -4889,7 +5090,9 @@ fn spec_from_generated(spec: GeneratedSpec) -> Result<SpecDocument> {
         status: spec.status,
         created,
         updated,
-        authors: normalize_authors(spec.authors),
+        authors,
+        authors_meta,
+        author_seeds,
         links: spec.links,
         updated_sort,
         extra: spec.extra,
@@ -6982,6 +7185,8 @@ mod tests {
                 created: None,
                 updated: None,
                 authors: vec![],
+                authors_meta: vec![],
+                author_seeds: vec![],
                 links: vec![],
                 updated_sort: 0,
                 extra: HashMap::new(),
