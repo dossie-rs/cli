@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Write;
@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod highlight;
 mod metadata;
 
 use actix_files::Files;
@@ -4511,6 +4512,7 @@ fn render_index(state: &AppState, prefix: &str, trailing_slashes: bool) -> Marku
         &state.site_description,
         LayoutAssets {
             css: &css,
+            highlight_css: None,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
             mermaid_js_url: None,
@@ -4558,6 +4560,7 @@ fn render_spec(
 
     let mini_toc_js = state.assets.mini_toc_script();
     let needs_mermaid = has_mermaid_markup(rendered_html);
+    let needs_highlight = has_highlight_markup(rendered_html);
     let mermaid_js_url = if needs_mermaid {
         Some(join_prefix(prefix, "assets/mermaid.min.js"))
     } else {
@@ -4683,6 +4686,7 @@ fn render_spec(
         &description,
         LayoutAssets {
             css: &css,
+            highlight_css: needs_highlight.then(highlight::highlight_css),
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
             mermaid_js_url: mermaid_js_url.as_deref(),
@@ -4745,6 +4749,7 @@ fn render_author(
         &description,
         LayoutAssets {
             css: &css,
+            highlight_css: None,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
             mermaid_js_url: None,
@@ -4825,6 +4830,7 @@ fn render_status(
         &description,
         LayoutAssets {
             css: &css,
+            highlight_css: None,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
             mermaid_js_url: None,
@@ -4885,6 +4891,7 @@ fn render_status_index(state: &AppState, summaries: &[StatusSummary], prefix: &s
         &description,
         LayoutAssets {
             css: &css,
+            highlight_css: None,
             theme_init_js: &theme_init_js,
             theme_toggle_js: &theme_toggle_js,
             mermaid_js_url: None,
@@ -4961,6 +4968,9 @@ fn format_display_id(prefix: &str, base_id: &str) -> String {
 
 struct LayoutAssets<'a> {
     css: &'a str,
+    /// Generated syntax-highlighting stylesheet, inlined only on pages that
+    /// contain a highlighted code block (`None` otherwise).
+    highlight_css: Option<&'a str>,
     theme_init_js: &'a str,
     theme_toggle_js: &'a str,
     mermaid_js_url: Option<&'a str>,
@@ -4989,6 +4999,7 @@ fn base_layout(
 ) -> Markup {
     let LayoutAssets {
         css,
+        highlight_css,
         theme_init_js,
         theme_toggle_js,
         mermaid_js_url,
@@ -5008,6 +5019,9 @@ fn base_layout(
                 link rel="icon" type="image/svg+xml" href=(favicon_href.clone());
                 title { (title) }
                 style { (PreEscaped(css)) }
+                @if let Some(highlight_css) = highlight_css {
+                    style { (PreEscaped(highlight_css)) }
+                }
                 script { (PreEscaped(theme_init_js)) }
             }
             body {
@@ -5166,6 +5180,13 @@ fn has_mermaid_markup(html: &str) -> bool {
         || html.contains("class='mermaid'")
         || html.contains("language-mermaid")
         || html.contains("lang-mermaid")
+}
+
+/// Whether rendered HTML contains a syntax-highlighted code block, which is the
+/// only content that needs the generated highlight stylesheet inlined. The
+/// marker class is emitted by `render_markdown` when a block is highlighted.
+fn has_highlight_markup(html: &str) -> bool {
+    html.contains("<pre class=\"hl\">")
 }
 
 fn render_asciidoc_document(doc: &AsciidocDocument<'_>) -> String {
@@ -5477,28 +5498,21 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn is_mermaid_fence(info: &str) -> bool {
-    let trimmed = info.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let token = trimmed
+/// The leading language token of a fenced code block's info string, e.g.
+/// `rust` from ```` ```rust,ignore ````. Empty when there is no info string.
+fn fence_token(info: &str) -> &str {
+    info.trim()
         .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
         .next()
-        .unwrap_or("");
-    token.eq_ignore_ascii_case("mermaid")
+        .unwrap_or("")
+}
+
+fn is_mermaid_fence(info: &str) -> bool {
+    fence_token(info).eq_ignore_ascii_case("mermaid")
 }
 
 fn is_svgbob_fence(info: &str) -> bool {
-    let trimmed = info.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let token = trimmed
-        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
-        .next()
-        .unwrap_or("");
-    token.eq_ignore_ascii_case("svgbob")
+    fence_token(info).eq_ignore_ascii_case("svgbob")
 }
 
 fn is_mermaid_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
@@ -5563,10 +5577,14 @@ fn is_svgbob_attrlist(attrlist: Option<&Attrlist<'_>>) -> bool {
     false
 }
 
-#[derive(Clone, Copy)]
 enum SpecialCodeBlock {
     Mermaid,
     Svgbob,
+    /// A highlightable fenced block whose source is captured and re-emitted as a
+    /// single pre-rendered, syntax-highlighted HTML event on the closing fence.
+    Highlight {
+        token: String,
+    },
 }
 
 fn render_svgbob_svg(source: &str) -> String {
@@ -5599,48 +5617,72 @@ fn render_markdown(source: &str) -> String {
     options.insert(MdOptions::ENABLE_TABLES);
     options.insert(MdOptions::ENABLE_FOOTNOTES);
     let parser = Parser::new_ext(source, options);
-    let special_block = Cell::new(None);
-    let svgbob_buffer = RefCell::new(String::new());
+    // Holds the source of the block currently being captured — svgbob (rendered
+    // to SVG) or a highlightable block (rendered to highlighted spans). Both
+    // states are mutually exclusive, so one buffer serves both.
+    let special_block = RefCell::new(None::<SpecialCodeBlock>);
+    let capture_buffer = RefCell::new(String::new());
+    let is_capturing = || {
+        matches!(
+            &*special_block.borrow(),
+            Some(SpecialCodeBlock::Svgbob) | Some(SpecialCodeBlock::Highlight { .. })
+        )
+    };
     let parser = parser.map(|event| match event {
         Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
             if is_mermaid_fence(&info) {
-                special_block.set(Some(SpecialCodeBlock::Mermaid));
+                *special_block.borrow_mut() = Some(SpecialCodeBlock::Mermaid);
                 Event::Html("<pre class=\"mermaid\">".into())
             } else if is_svgbob_fence(&info) {
-                special_block.set(Some(SpecialCodeBlock::Svgbob));
-                svgbob_buffer.borrow_mut().clear();
+                *special_block.borrow_mut() = Some(SpecialCodeBlock::Svgbob);
+                capture_buffer.borrow_mut().clear();
+                Event::Html("".into())
+            } else if highlight::is_highlightable(fence_token(&info)) {
+                let token = fence_token(&info).to_string();
+                *special_block.borrow_mut() = Some(SpecialCodeBlock::Highlight { token });
+                capture_buffer.borrow_mut().clear();
                 Event::Html("".into())
             } else {
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
             }
         }
-        Event::End(TagEnd::CodeBlock) => match special_block.get() {
-            Some(SpecialCodeBlock::Mermaid) => {
-                special_block.set(None);
-                Event::Html("</pre>".into())
-            }
+        Event::End(TagEnd::CodeBlock) => match special_block.borrow_mut().take() {
+            Some(SpecialCodeBlock::Mermaid) => Event::Html("</pre>".into()),
             Some(SpecialCodeBlock::Svgbob) => {
-                special_block.set(None);
-                let source = svgbob_buffer.borrow().clone();
+                let source = capture_buffer.borrow().clone();
                 let svg = render_svgbob_svg(&source);
                 Event::Html(format!("<div class=\"svgbob\">{svg}</div>").into())
             }
+            Some(SpecialCodeBlock::Highlight { token }) => {
+                let code = capture_buffer.borrow();
+                let inner =
+                    highlight::highlight(&token, &code).unwrap_or_else(|| escape_html(&code));
+                Event::Html(
+                    format!(
+                        "<pre class=\"hl\"><code class=\"language-{}\">{inner}</code></pre>\n",
+                        escape_html(&token),
+                    )
+                    .into(),
+                )
+            }
             None => Event::End(TagEnd::CodeBlock),
         },
-        Event::Text(text) => match special_block.get() {
-            Some(SpecialCodeBlock::Svgbob) => {
-                svgbob_buffer.borrow_mut().push_str(&text);
+        Event::Text(text) => {
+            if is_capturing() {
+                capture_buffer.borrow_mut().push_str(&text);
                 Event::Html("".into())
+            } else {
+                Event::Text(text)
             }
-            _ => Event::Text(text),
-        },
-        Event::SoftBreak | Event::HardBreak => match special_block.get() {
-            Some(SpecialCodeBlock::Svgbob) => {
-                svgbob_buffer.borrow_mut().push('\n');
+        }
+        Event::SoftBreak | Event::HardBreak => {
+            if is_capturing() {
+                capture_buffer.borrow_mut().push('\n');
                 Event::Html("".into())
+            } else {
+                event
             }
-            _ => event,
-        },
+        }
         _ => event,
     });
     let mut html = String::new();
@@ -7048,6 +7090,56 @@ mod tests {
             html.contains("<h1"),
             "doctype title should be present, got: {html}"
         );
+    }
+
+    #[test]
+    fn fenced_code_block_is_syntax_highlighted() {
+        let html = render_markdown("```rust\nfn main() {}\n```\n");
+        assert!(
+            html.contains("<pre class=\"hl\">"),
+            "not highlighted: {html}"
+        );
+        assert!(html.contains("class=\"hl-"), "no scope spans: {html}");
+        assert!(
+            html.contains("class=\"language-rust\""),
+            "lang lost: {html}"
+        );
+    }
+
+    #[test]
+    fn mermaid_code_block_passes_through_untouched() {
+        // Diagram blocks are rendered client-side from raw source, so they must
+        // keep the `mermaid` marker and must not be highlighted.
+        let html = render_markdown("```mermaid\ngraph TD; A-->B;\n```\n");
+        assert!(
+            html.contains("class=\"mermaid\""),
+            "mermaid marker lost: {html}"
+        );
+        assert!(
+            !html.contains("class=\"hl-"),
+            "mermaid was highlighted: {html}"
+        );
+        assert!(html.contains("graph TD"), "mermaid source lost: {html}");
+    }
+
+    #[test]
+    fn svgbob_code_block_renders_svg_not_highlighted() {
+        // svgbob is rendered server-side to inline SVG and must not be treated
+        // as a highlightable language.
+        let html = render_markdown("```svgbob\n+--+\n|  |\n+--+\n```\n");
+        assert!(html.contains("class=\"svgbob\""), "no svgbob div: {html}");
+        assert!(html.contains("<svg"), "svgbob svg missing: {html}");
+        assert!(!html.contains("class=\"hl-"), "svgbob highlighted: {html}");
+    }
+
+    #[test]
+    fn unknown_language_renders_as_plain_escaped_code() {
+        let html = render_markdown("```\n<not code>\n```\n");
+        assert!(
+            !html.contains("class=\"hl-"),
+            "plain block highlighted: {html}"
+        );
+        assert!(html.contains("&lt;not code&gt;"), "not escaped: {html}");
     }
 
     #[test]
